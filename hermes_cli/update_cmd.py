@@ -3846,8 +3846,11 @@ def _download_hermes_setup(url: str, dest: Path) -> bool:
     """Download the installer to ``dest``. Returns False on any failure."""
     import urllib.request
 
+    # The asset CDN rejects urllib's default Python-urllib/3.x agent
+    # with 403; identify as Hermes instead.
+    request = urllib.request.Request(url, headers={"User-Agent": "hermes-agent-eject"})
     try:
-        with urllib.request.urlopen(url, timeout=120) as resp, open(dest, "wb") as out:
+        with urllib.request.urlopen(request, timeout=120) as resp, open(dest, "wb") as out:
             shutil.copyfileobj(resp, out)
         return True
     except OSError as exc:
