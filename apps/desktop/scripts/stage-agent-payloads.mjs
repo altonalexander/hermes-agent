@@ -557,6 +557,9 @@ function writeBundlePth(outDir, pythonBinary) {
 
 function stageNode(target, outDir) {
   const nodeDir = path.join(outDir, "node")
+  // Idempotent: a leftover tree from an interrupted run makes cpSync
+  // throw EEXIST on directory merges; start clean every time.
+  fs.rmSync(nodeDir, { recursive: true, force: true })
   fs.mkdirSync(nodeDir, { recursive: true })
   const src = process.env.HERMES_PAYLOAD_NODE_DIST
   if (!src) {
