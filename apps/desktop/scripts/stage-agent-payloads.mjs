@@ -1,30 +1,35 @@
 /**
- * stage-agent-payloads.mjs: assemble the offline agent payload tree that
- * ships inside the bundled desktop artifact. Design:
- * .hermes/plans/2026-08-05_desktop-bundled-payloads-channels-eject.md §2.
+ * stage-agent-payloads.mjs: assemble the resources-resident agent runtime
+ * that ships inside the bundled desktop artifact. Design:
+ * .hermes/plans/2026-08-07_resources-resident-bundled-runtime.md.
  *
  * Output: apps/desktop/build/agent-payload/
  *   manifest.json          schemaVersion, tag, commit, platform, arch, per-item status
- *   repo/                  a shallow git clone at the release tag. It keeps
- *                          .git, which makes `hermes update --eject` almost
- *                          free and keeps the checkout git-shaped.
+ *   repo/                  plain source tree at the release tag (no .git),
+ *                          plus the PREBUILT JS surfaces (ui-tui dist +
+ *                          node_modules, web_dist) and the build stamp
  *   uv/                    static uv binary for this platform/arch
- *   python/                uv-managed CPython (python-build-standalone)
- *   wheels/                the resolved wheelhouse from uv.lock for this platform/arch
+ *   python/                uv-managed CPython (python-build-standalone).
+ *                          Its own site-packages carries hermes-bundle.pth
+ *                          with RELATIVE paths to repo/ and site-packages/,
+ *                          so the interpreter resolves the runtime wherever
+ *                          the app bundle sits — no venv, no PYTHONPATH.
+ *   site-packages/         the full dependency tree from uv.lock, installed
+ *                          at build time with `pip install --target` on the
+ *                          payload interpreter. The backend runs directly
+ *                          from here; nothing materializes at first launch.
  *   node/                  official node dist for this platform/arch
- *   js-prebuilt.tar.gz     PREBUILT JS surfaces + node_modules (ui-tui dist +
- *                          hermes-ink, web_dist). Thus the first launch never
- *                          runs npm install or npm run build.
  *
  * Gating: the script does nothing unless HERMES_DESKTOP_BUNDLED=1. That
  * variable is an internal build-time env for CI wiring, not user config.
  * Thus dev builds and current CI keep producing thin builds. You can skip
  * individual items with --skip=<item,item> for incremental CI caching.
- * The manifest.json records every skip. Thus the bootstrap knows to fall
- * back to its network path for that stage (per-stage fallback rule, plan §3).
+ * The manifest.json records every skip. The desktop only runs resident when
+ * every runtime item is staged; a partial payload falls back to the network
+ * bootstrap path.
  *
- * The heavy work shells out to git, uv, npm, and tar. The decision logic
- * (target resolution, uv arg construction, manifest shape) is exported as
+ * The heavy work shells out to git, uv, and tar. The decision logic
+ * (target resolution, pip arg construction, manifest shape) is exported as
  * pure functions. Thus vitest covers it without network or toolchains.
  */
 
@@ -34,13 +39,13 @@ import path from "node:path"
 
 import { isMain } from "./utils.mjs"
 
-export const PAYLOAD_SCHEMA_VERSION = 1
+export const PAYLOAD_SCHEMA_VERSION = 2
 
 const DESKTOP_ROOT = path.resolve(import.meta.dirname, "..")
 const REPO_ROOT = path.resolve(DESKTOP_ROOT, "..", "..")
 const OUT_DIR = path.join(DESKTOP_ROOT, "build", "agent-payload")
 
-export const PAYLOAD_ITEMS = ["repo", "uv", "python", "wheels", "node", "js-prebuilt"]
+export const PAYLOAD_ITEMS = ["repo", "uv", "python", "site-packages", "node"]
 
 /**
  * Map (process.platform, process.arch) to the uv, python-build-standalone,
@@ -108,32 +113,37 @@ export function resolveTargets(platform = process.platform, arch = process.arch)
 }
 
 /**
- * Build the `pip wheel` argument list. The caller invokes it through
- * `uvx pip …`, so no host pip install is necessary. It runs NATIVELY on
- * the target runner. With --only-binary=:all:, it downloads prebuilt
- * wheels for this platform and never compiles. An sdist in the payload
- * tries to build at first launch, which is offline and has no toolchain.
- * Thus the arguments refuse sdists outright. The consumer runs
- * `uv sync --frozen --offline --no-index --find-links`.
+ * Build the `pip install --target` argument list that fills the payload's
+ * site-packages. The caller invokes it through `uvx pip …` ON the staged
+ * payload interpreter, natively on the target runner, so wheels resolve
+ * for the target platform/arch. With --only-binary=:all: it never
+ * compiles on the user machine — there IS no install step on the user
+ * machine; the backend imports straight from this directory.
  *
  * Exception: the target's sourceBuild list. Some pinned packages publish
  * no wheel for a target (win32-arm64: cryptography dropped win_arm64
  * after 46.0.3; httptools and ruamel-yaml-clib never shipped one;
  * pywinpty 2.x has none). For those named packages pip builds the
  * EXACT pinned version from its sdist ON the build runner, which yields
- * a real target-arch wheel in the payload — the user machine still
+ * real target-arch code in site-packages — the user machine still
  * never compiles. The build runner needs the toolchains (MSVC arm64 +
  * Rust on windows-11-arm). A later --no-binary overrides --only-binary
  * per package; the list stays empty for every target whose pins are
  * fully covered by published wheels.
  */
-export function wheelDownloadArgs({ wheelsDir, sourceBuild = [] }) {
+export function pipTargetArgs({ sitePackagesDir, sourceBuild = [] }) {
   return [
-    "wheel",
+    "install",
     "--only-binary", ":all:",
     ...(sourceBuild.length > 0 ? ["--no-binary", sourceBuild.join(",")] : []),
     "-r", "requirements-payload.txt",
-    "-w", wheelsDir,
+    "--target", sitePackagesDir,
+    // pip warns without this when --target sees an existing dir; staging
+    // wipes first, so upgrade semantics never actually apply.
+    "--upgrade",
+    // No console-script shims: the bundle always launches `python -m`,
+    // and --target's scripts would carry the BUILD host's shebang paths.
+    "--no-compile",
   ]
 }
 

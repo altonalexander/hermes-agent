@@ -42,6 +42,7 @@ on:
 
 permissions:
   contents: write # for the release asset upload; read-only for all other content
+  id-token: write # for the OIDC federated login to Azure (Windows signing)
 
 concurrency:
   group: desktop-bundled-release-${{ github.event.inputs.tag || github.ref }}
@@ -163,6 +164,22 @@ jobs:
             printf 'OPENSSL_STATIC=1\n'
           } >> "$GITHUB_ENV"
 
+      # ── Azure OIDC login for Windows signing ───────────────────────────
+      # No client secret exists anywhere. GitHub mints an OIDC token for
+      # this job; Azure redeems it only when the token's subject matches
+      # the app registration's federated credential
+      # (repo:<owner>/<repo>:environment:release-signing). electron-
+      # builder's TrustedSigning module then picks the CLI credential up
+      # from the Azure credential chain. Skipped when the environment
+      # variables are absent (forks, dry runs) — the build stays unsigned.
+      - name: Azure login (OIDC)
+        if: startsWith(matrix.label, 'win32-') && vars.AZURE_CLIENT_ID != ''
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
       # ── Build + package through the shared script ──────────────────────
       # scripts/build-bundled-desktop.mjs owns the whole sequence: the JS
       # surface builds, the payload node dist, the bundled desktop build,
@@ -180,23 +197,20 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
-          # Windows signing with Azure Trusted Signing. The signing DLib
-          # authenticates with these three variables at sign time. The
-          # certificate never touches the runner disk.
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-          # Non-secret Azure signing parameters. Set these repo variables to
-          # turn Windows signing on. Without them the build stays unsigned,
-          # so forks and dry runs continue to work.
+          # Windows signing with Azure Trusted Signing. The TrustedSigning
+          # module authenticates through the OIDC login above — no secret
+          # exists. These non-secret variables in the release-signing
+          # environment turn signing on; without them the build stays
+          # unsigned, so forks and dry runs continue to work.
           AZURE_SIGN_ENDPOINT: ${{ vars.AZURE_SIGN_ENDPOINT }}
           AZURE_SIGN_ACCOUNT: ${{ vars.AZURE_SIGN_ACCOUNT }}
           AZURE_SIGN_PROFILE: ${{ vars.AZURE_SIGN_PROFILE }}
           AZURE_SIGN_PUBLISHER: ${{ vars.AZURE_SIGN_PUBLISHER }}
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
         run: |
           SIGN_ARGS=()
           MATRIX_LABEL="${{ matrix.label }}"
-          if [[ "$MATRIX_LABEL" == win32-* ]] && [ -n "$AZURE_SIGN_ENDPOINT" ] && [ -n "$AZURE_CLIENT_SECRET" ]; then
+          if [[ "$MATRIX_LABEL" == win32-* ]] && [ -n "$AZURE_SIGN_ENDPOINT" ] && [ -n "$AZURE_CLIENT_ID" ]; then
             echo "Windows signing: Azure Trusted Signing at $AZURE_SIGN_ENDPOINT"
             SIGN_ARGS+=(
               "-c.win.signAndEditExecutable=true"
