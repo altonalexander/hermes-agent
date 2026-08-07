@@ -2,20 +2,21 @@ name: Desktop Bundled Release
 
 # This workflow builds the fully self-contained desktop installers for each
 # (os, arch) target. The agent payloads are baked in: the repo snapshot at
-# the release tag, uv plus CPython, the wheelhouse, node, and the prebuilt
-# TUI/dashboard JS. The design is in
-# .hermes/plans/2026-08-05_desktop-bundled-payloads-channels-eject.md.
+# the release tag (with the prebuilt TUI/dashboard JS), uv plus CPython, a
+# ready site-packages tree, and node. The design is in
+# .hermes/plans/2026-08-07_resources-resident-bundled-runtime.md: the app
+# runs the backend directly out of its own resources; nothing installs on
+# the user machine.
 #
-# The full bundled-install stack (install manifest, --payload-dir stages,
-# desktop adoption and re-materialization) stays dormant unless a build sets
-# HERMES_DESKTOP_BUNDLED=1. This workflow is the only place that sets it.
+# Payload staging stays dormant unless a build sets HERMES_DESKTOP_BUNDLED=1.
+# This workflow is the only place that sets it.
 #
 # Triggers:
 #   * A push of a final release tag (vX.Y.Z). This is the normal release path.
 #   * workflow_dispatch with an explicit tag, for re-runs and dry runs. The
 #     release upload is opt-in.
 #
-# Each runner fetches wheels, uv, python, and node natively. This is why the
+# Each runner installs site-packages, uv, python, and node natively. This is why the
 # workflow is a matrix: electron-builder needs per-OS runners for signing.
 # As a result, there are no cross-platform wheel-tag tables anywhere.
 #

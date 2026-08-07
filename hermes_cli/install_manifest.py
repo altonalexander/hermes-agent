@@ -12,7 +12,7 @@ The file records where a checkout came from and where its updates come from:
       "schemaVersion": 1,
       "installMode": "bundled" | "source",
       "channel": "stable" | "main",
-      "manageStyle": "adopted" | "auto-adopted" | "ejected",  # optional
+      "manageStyle": "adopted" | "ejected",  # optional
       "pinnedCommit": "<sha>",       # optional
       "pinnedTag": "v0.17.0"         # optional, bundled installs only
     }
@@ -34,16 +34,12 @@ Semantics
 * ``manageStyle`` — how the install got into its current mode.
   ``installMode`` says where it is now. Values:
 
-  - ``"adopted"`` — the user selected a bundled install (installer run).
-  - ``"auto-adopted"`` — the desktop app silently moved a clean legacy
-    checkout into the bundled path at launch. This value is different from
-    ``"adopted"`` for one reason: a bad auto-adoption group can be reverted
-    without touching users who gave consent.
+  - ``"adopted"`` — the install is desktop-managed (a resident bundle's
+    static manifest, or an installer run that selected bundled mode).
   - ``"ejected"`` — the user ran ``hermes update --eject``. This opt-out is
-    permanent. Auto-adoption must not touch an ejected checkout, although
-    its ``installMode`` is ``"source"``.
+    permanent, although the resulting ``installMode`` is ``"source"``.
   - missing — a legacy checkout from before manifests, or a plain source
-    install. Auto-adoption examines only this state.
+    install.
 
 This is a pure-stdlib leaf module. It does not import hermes_cli.config.
 A config import would pull the full config machinery into every consumer.
@@ -70,9 +66,8 @@ CHANNEL_STABLE = "stable"
 _VALID_CHANNELS = (CHANNEL_MAIN, CHANNEL_STABLE)
 
 STYLE_ADOPTED = "adopted"
-STYLE_AUTO_ADOPTED = "auto-adopted"
 STYLE_EJECTED = "ejected"
-_VALID_STYLES = (STYLE_ADOPTED, STYLE_AUTO_ADOPTED, STYLE_EJECTED)
+_VALID_STYLES = (STYLE_ADOPTED, STYLE_EJECTED)
 
 # Sentinel accepted in config.yaml's ``update.channel``: defer to the manifest.
 CHANNEL_AUTO = "auto"

@@ -43,13 +43,6 @@ param(
     [switch]$NonInteractive,
     [switch]$Json,
 
-    # --- Offline payload tree (desktop bundled artifact) ---
-    # Points at the agent-payload/ directory in the bundled desktop app's
-    # resources (see apps/desktop/scripts/stage-agent-payloads.mjs). Stages
-    # that normally use the network read local content from the payload
-    # instead. If an item is missing, the stage uses its normal network path.
-    [string]$PayloadDir = "",
-
     # Print the paths this install would use, as JSON, and exit without
     # touching anything. The first question on any "installer says a path
     # doesn't exist" report is which paths it actually resolved -- especially
@@ -4007,7 +4000,7 @@ function Stage-Node             {
     }
 }
 function Stage-SystemPackages   { Install-SystemPackages }
-function Stage-Repository       { if (-not (Invoke-PayloadStageRepository)) { Install-Repository } }
+function Stage-Repository       { Install-Repository }
 function Stage-Venv             { Resolve-UvCmd; Install-Venv }
 function Stage-Dependencies     { Resolve-UvCmd; Install-Dependencies }
 function Stage-NodeDeps         { Install-NodeDeps }
@@ -4015,108 +4008,9 @@ function Stage-Desktop          { Install-DesktopVoiceDeps; Install-Desktop }
 function Stage-Path             { Set-PathVariable }
 function Stage-ConfigTemplates  { Copy-ConfigTemplates }
 function Stage-PlatformSdks     { Resolve-UvCmd; Install-PlatformSdks }
-function Stage-BootstrapMarker  { Write-BootstrapMarker; Write-InstallModeManifest }
+function Stage-BootstrapMarker  { Write-BootstrapMarker }
 function Stage-Configure        { Invoke-SetupWizard }
 function Stage-Gateway          { Start-GatewayIfConfigured }
-
-# --- Offline payload support (-PayloadDir; desktop bundled artifact) ---
-# This section is a mirror of the payload_* helpers in install.sh. Each
-# network-touching stage first tries the payload. A $false return means
-# "fall back to the normal network path". Keep the two scripts in lockstep.
-
-function Get-PayloadManifest {
-    if (-not $PayloadDir) { return $null }
-    $manifestPath = Join-Path $PayloadDir "manifest.json"
-    if (-not (Test-Path $manifestPath)) { return $null }
-    try { return (Get-Content $manifestPath -Raw | ConvertFrom-Json) } catch { return $null }
-}
-
-function Test-PayloadHas {
-    param([string]$Item)
-    $m = Get-PayloadManifest
-    if (-not $m -or -not $m.items) { return $false }
-    $entry = $m.items.PSObject.Properties[$Item]
-    return ($null -ne $entry -and $entry.Value.status -eq "staged")
-}
-
-function Get-PayloadTag {
-    $m = Get-PayloadManifest
-    if ($m -and $m.tag) { return [string]$m.tag }
-    return ""
-}
-
-function Test-PayloadRefusesSourceCheckout {
-    # The eject contract: never overwrite a checkout whose .hermes-install.json
-    # says installMode source. A missing manifest is not a refusal.
-    $manifestPath = Join-Path $InstallDir ".hermes-install.json"
-    if (-not (Test-Path $manifestPath)) { return $false }
-    try {
-        $m = Get-Content $manifestPath -Raw | ConvertFrom-Json
-        return ($m.installMode -eq "source")
-    } catch { return $false }
-}
-
-function Invoke-PayloadStageRepository {
-    if (-not (Test-PayloadHas "repo")) { return $false }
-    if ((Test-Path $InstallDir) -and (Test-PayloadRefusesSourceCheckout)) {
-        Write-Info "Existing checkout is source-managed (ejected) - leaving it alone"
-        return $true
-    }
-    $tag = Get-PayloadTag
-    Write-Info "Materializing Hermes Agent from bundled payload ($tag)..."
-    $payloadRepo = Join-Path $PayloadDir "repo"
-    # The payload repo is a plain source tree with NO .git (bundled installs
-    # never run git against the checkout; eject makes its own fresh clone).
-    # Replace an existing checkout's tree but keep the expensive runtime
-    # dirs (wheels/js stages refresh them in place) and user secrets. The
-    # old .git of an adopted legacy checkout is dropped on purpose.
-    if (Test-Path $InstallDir) {
-        $keep = @("venv", "node_modules", ".env")
-        Get-ChildItem -Force -LiteralPath $InstallDir | Where-Object { $keep -notcontains $_.Name } | ForEach-Object {
-            Remove-Item -Recurse -Force -LiteralPath $_.FullName
-        }
-        Copy-Item -Recurse -Force (Join-Path $payloadRepo "*") $InstallDir
-    } else {
-        $parent = Split-Path $InstallDir -Parent
-        if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-        Copy-Item -Recurse $payloadRepo $InstallDir
-    }
-    Write-Success "Checkout materialized offline at $tag"
-    return $true
-}
-
-
-
-function Write-InstallModeManifest {
-    # Decides and writes .hermes-install.json at install completion. The
-    # function never overwrites an ejected manifest. The opt-out is sticky.
-    if (-not (Test-Path $InstallDir)) { return }
-    $manifestPath = Join-Path $InstallDir ".hermes-install.json"
-    if (Test-Path $manifestPath) {
-        try {
-            $existing = Get-Content $manifestPath -Raw | ConvertFrom-Json
-            if ($existing.manageStyle -eq "ejected") {
-                Write-Info "Install manifest says ejected - preserving it"
-                return
-            }
-        } catch { }
-    }
-    $payload = ($PayloadDir -and (Test-PayloadHas "repo") -and -not (Test-PayloadRefusesSourceCheckout))
-    $obj = [ordered]@{ schemaVersion = 1 }
-    if ($payload) {
-        $obj.installMode = "bundled"
-        $obj.channel = "stable"
-        $obj.manageStyle = "adopted"
-        $tag = Get-PayloadTag
-        if ($tag) { $obj.pinnedTag = $tag }
-    } else {
-        $obj.installMode = "source"
-        $obj.channel = "main"
-    }
-    $tmp = "$manifestPath.tmp"
-    ($obj | ConvertTo-Json) + "`n" | Set-Content -Path $tmp -Encoding utf8
-    Move-Item -Force $tmp $manifestPath
-}
 
 function Get-InstallStage {
     param([string]$Name)

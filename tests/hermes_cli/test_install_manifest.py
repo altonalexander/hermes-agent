@@ -11,7 +11,6 @@ from hermes_cli.install_manifest import (
     MODE_BUNDLED,
     MODE_SOURCE,
     STYLE_ADOPTED,
-    STYLE_AUTO_ADOPTED,
     STYLE_EJECTED,
     format_bundled_update_message,
     install_manifest_path,
@@ -109,7 +108,7 @@ class TestManageStyle:
         assert not is_ejected(tmp_path)
 
     def test_valid_styles_roundtrip(self, tmp_path):
-        for style in (STYLE_ADOPTED, STYLE_AUTO_ADOPTED, STYLE_EJECTED):
+        for style in (STYLE_ADOPTED, STYLE_EJECTED):
             write_install_manifest(
                 {"installMode": MODE_SOURCE, "channel": CHANNEL_MAIN, "manageStyle": style},
                 tmp_path,

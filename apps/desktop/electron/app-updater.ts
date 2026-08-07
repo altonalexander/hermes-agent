@@ -2,10 +2,9 @@
 //
 // Bundled installs update through GitHub Releases: electron-updater reads
 // latest*.yml from the release that the desktop-bundled-release workflow
-// attached, downloads the new installer, and applies it. After the relaunch,
-// the bootstrap compares the marker tag with the new stamp tag. On a
-// mismatch, it rebuilds the agent runtime offline from the new payloads
-// (see bundled-runtime.needsRematerialization).
+// attached, downloads the new installer, and applies it. The swapped-in app
+// carries the new runtime in its own resources (resident mode), so there is
+// no post-update install step at all.
 //
 // Source installs never reach this module. The callers gate on the install
 // manifest first and fall through to the git-based update path.

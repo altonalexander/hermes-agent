@@ -81,7 +81,6 @@ STAGE_NAME=""
 JSON_OUTPUT=false
 NON_INTERACTIVE=false
 INCLUDE_DESKTOP=false
-PAYLOAD_DIR=""
 
 # Detect non-interactive mode (e.g. curl | bash)
 # When stdin is not a terminal, read -p will fail with EOF,
@@ -152,10 +151,6 @@ while [[ $# -gt 0 ]]; do
             HERMES_HOME="$2"
             shift 2
             ;;
-        --payload-dir|-PayloadDir)
-            PAYLOAD_DIR="$2"
-            shift 2
-            ;;
         --ensure)
             ENSURE_DEPS="$2"
             shift 2
@@ -186,10 +181,6 @@ while [[ $# -gt 0 ]]; do
             echo "                   default (non-root):  ~/.hermes/hermes-agent"
             echo "                   default (root, Linux): /usr/local/lib/hermes-agent"
             echo "  --hermes-home PATH  Data directory (default: ~/.hermes, or \$HERMES_HOME)"
-            echo "  --payload-dir PATH  Offline payload tree (desktop bundled artifact)."
-            echo "                   Install stages read local content from the payload:"
-            echo "                   repo snapshot (with prebuilt JS), uv, python, node."
-            echo "                   If an item is missing, the stage uses the network."
             echo "  -h, --help     Show this help"
             echo ""
             echo "Notes:"
@@ -354,157 +345,6 @@ emit_stage_json() {
     else
         printf '{"ok":%s,"stage":"%s","skipped":%s}\n' "$ok" "$stage" "$skipped"
     fi
-}
-
-# ============================================================================
-# Offline payload support (--payload-dir; desktop bundled artifact)
-#
-# The bundled desktop app ships an agent-payload/ tree in its resources.
-# The script apps/desktop/scripts/stage-agent-payloads.mjs assembles this
-# tree. Each install stage that normally uses the network first tries the
-# payload. If an item is missing or not usable, the stage uses its normal
-# network path. With this per-stage fallback, a partial payload degrades
-# and does not fail the bootstrap.
-# ============================================================================
-
-# payload_has ITEM: returns true when a usable payload directory is set and
-# its manifest.json marks ITEM as staged. The function uses grep on the
-# known manifest shape, because jq is not a prerequisite at bootstrap time.
-# Items are objects like:
-#   "wheels": { "status": "staged" }
-payload_has() {
-    local item="$1"
-    [ -n "$PAYLOAD_DIR" ] && [ -f "$PAYLOAD_DIR/manifest.json" ] || return 1
-    # Permit whitespace and newlines between the key and its status. If the
-    # item is not marked staged (skipped or failed), use the network path.
-    tr -d '\n\r\t ' < "$PAYLOAD_DIR/manifest.json" \
-        | grep -q "\"$item\":{\"status\":\"staged\"" || return 1
-    return 0
-}
-
-# payload_tag: prints the pinned release tag from manifest.json. If the tag
-# is absent, prints "".
-payload_tag() {
-    [ -n "$PAYLOAD_DIR" ] && [ -f "$PAYLOAD_DIR/manifest.json" ] || { echo ""; return; }
-    tr -d '\n\r\t ' < "$PAYLOAD_DIR/manifest.json" \
-        | sed -n 's/.*"tag":"\([^"]*\)".*/\1/p'
-}
-
-# payload_refuses_source_checkout: the eject contract (plan §4.3). A payload
-# materialization must never overwrite a checkout that the user manages.
-# Returns true (refuse) only when the existing checkout's .hermes-install.json
-# says that the install is source-managed. A missing manifest is not a
-# refusal. The repository stage's normal update path handles pre-manifest
-# checkouts. Silent adoption in the desktop app decides separately if it
-# migrates them.
-payload_refuses_source_checkout() {
-    local manifest="$INSTALL_DIR/.hermes-install.json"
-    [ -f "$manifest" ] || return 1
-    tr -d '\n\r\t ' < "$manifest" | grep -q '"installMode":"source"'
-}
-
-# payload_stage_repo: materializes the checkout from the payload's plain
-# source tree. The payload deliberately carries NO .git: bundled installs
-# never run git against the checkout (app updates replace the whole tree,
-# and `hermes update --eject` makes its own fresh clone). Version
-# provenance comes from the .hermes_build_info.json stamp inside the tree.
-# Returns 1 to signal "fall back".
-payload_stage_repo() {
-    payload_has repo || return 1
-    if [ -d "$INSTALL_DIR" ]; then
-        if payload_refuses_source_checkout; then
-            log_info "Existing checkout is source-managed (ejected) — leaving it alone"
-            # This success is deliberate. The user's own checkout satisfies
-            # the stage. The desktop boots the current checkout.
-            return 0
-        fi
-    fi
-    log_info "Materializing Hermes Agent from bundled payload ($(payload_tag))..."
-    mkdir -p "$(dirname "$INSTALL_DIR")"
-    if [ -d "$INSTALL_DIR" ]; then
-        # Replace an existing bundled or adopted-legacy checkout with the
-        # payload tree, but keep the expensive runtime dirs (the venv and
-        # node_modules refresh in place) and user secrets. The
-        # old .git of an adopted legacy checkout is dropped on purpose:
-        # a bundled checkout is gitless by design.
-        local keep entry
-        keep="venv node_modules .env"
-        for entry in "$INSTALL_DIR"/* "$INSTALL_DIR"/.[!.]*; do
-            [ -e "$entry" ] || continue
-            case " $keep " in
-                *" $(basename "$entry") "*) ;;
-                *) rm -rf "$entry" ;;
-            esac
-        done
-        cp -R "$PAYLOAD_DIR/repo/." "$INSTALL_DIR/" || return 1
-    else
-        cp -R "$PAYLOAD_DIR/repo" "$INSTALL_DIR" || return 1
-    fi
-    log_success "Checkout materialized offline at $(payload_tag)"
-}
-
-# payload_stage_runtimes: seeds the Hermes-managed uv ($HERMES_HOME/bin/uv)
-# and node ($HERMES_HOME/node) from the payload. This runs before install_uv
-# and check_node probe for them. Both helpers prefer an existing managed
-# runtime, so the seed makes their network path a no-op. Failures are not
-# fatal. The helpers then do their normal download.
-payload_stage_runtimes() {
-    [ -n "$PAYLOAD_DIR" ] || return 0
-    if payload_has uv && [ ! -x "$HERMES_HOME/bin/uv" ]; then
-        local uv_src
-        uv_src=$(find "$PAYLOAD_DIR/uv" -maxdepth 1 -type f -name 'uv*' 2>/dev/null | head -1)
-        if [ -n "$uv_src" ]; then
-            mkdir -p "$HERMES_HOME/bin"
-            cp "$uv_src" "$HERMES_HOME/bin/uv" && chmod +x "$HERMES_HOME/bin/uv" \
-                && log_success "uv seeded from bundled payload" \
-                || log_warn "Could not seed uv from payload (will download)"
-        fi
-    fi
-    if payload_has node && [ ! -x "$HERMES_HOME/node/bin/node" ] && [ -d "$PAYLOAD_DIR/node" ]; then
-        rm -rf "$HERMES_HOME/node.payload-tmp"
-        if cp -R "$PAYLOAD_DIR/node" "$HERMES_HOME/node.payload-tmp" 2>/dev/null; then
-            rm -rf "$HERMES_HOME/node"
-            mv "$HERMES_HOME/node.payload-tmp" "$HERMES_HOME/node"
-            log_success "Node.js seeded from bundled payload"
-        else
-            rm -rf "$HERMES_HOME/node.payload-tmp"
-            log_warn "Could not seed node from payload (will download)"
-        fi
-    fi
-    if payload_has python && [ -d "$PAYLOAD_DIR/python" ] && [ ! -d "$HERMES_HOME/python-payload" ]; then
-        # uv finds managed pythons through UV_PYTHON_INSTALL_DIR. Seed the
-        # payload interpreter, then export the variable for the venv and
-        # python-deps stages.
-        cp -R "$PAYLOAD_DIR/python" "$HERMES_HOME/python-payload" 2>/dev/null \
-            && log_success "CPython seeded from bundled payload" \
-            || log_warn "Could not seed python from payload (uv will download)"
-    fi
-    if [ -d "$HERMES_HOME/python-payload" ]; then
-        export UV_PYTHON_INSTALL_DIR="$HERMES_HOME/python-payload"
-    fi
-    return 0
-}
-
-# write_install_manifest_file MODE CHANNEL STYLE TAG: writes the
-# .hermes-install.json that hermes_cli/install_manifest.py reads. The write
-# is atomic (tmp+mv), with the same discipline as write_bootstrap_marker.
-write_install_manifest_file() {
-    local mode="$1" channel="$2" style="$3" tag="$4"
-    local manifest_path="$INSTALL_DIR/.hermes-install.json"
-    local tmp_path="$manifest_path.tmp"
-    local style_line=""
-    if [ -n "$style" ]; then
-        style_line="  \"manageStyle\": \"$style\",
-"
-    fi
-    local tag_line=""
-    if [ -n "$tag" ]; then
-        tag_line="  \"pinnedTag\": \"$tag\",
-"
-    fi
-    printf '{\n%s%s  "channel": "%s",\n  "installMode": "%s",\n  "schemaVersion": 1\n}\n' \
-        "$style_line" "$tag_line" "$channel" "$mode" > "$tmp_path"
-    mv -f "$tmp_path" "$manifest_path"
 }
 
 prompt_yes_no() {
@@ -2733,25 +2573,6 @@ write_bootstrap_marker() {
     mv -f "$tmp_path" "$marker_path"
 }
 
-# write_install_mode_manifest: decides and writes .hermes-install.json at
-# the end of an install. If this run materialized the checkout from a
-# payload, and the checkout is not an ejected one, the mode is bundled. In
-# all other cases the mode is source/main. The function never overwrites an
-# existing ejected manifest. The opt-out is sticky.
-write_install_mode_manifest() {
-    [ -d "$INSTALL_DIR" ] || return 0
-    local existing="$INSTALL_DIR/.hermes-install.json"
-    if [ -f "$existing" ] && tr -d '\n\r\t ' < "$existing" | grep -q '"manageStyle":"ejected"'; then
-        log_info "Install manifest says ejected — preserving it"
-        return 0
-    fi
-    if [ -n "$PAYLOAD_DIR" ] && payload_has repo && ! payload_refuses_source_checkout; then
-        write_install_manifest_file "bundled" "stable" "adopted" "$(payload_tag)"
-    else
-        write_install_manifest_file "source" "main" "" ""
-    fi
-}
-
 print_success() {
     echo ""
     echo -e "${GREEN}${BOLD}"
@@ -3366,7 +3187,6 @@ run_stage_body() {
             print_banner
             detect_os
             resolve_install_layout
-            payload_stage_runtimes
             install_uv
             check_python
             check_git
@@ -3378,13 +3198,12 @@ run_stage_body() {
             detect_os
             resolve_install_layout
             check_git
-            payload_stage_repo || clone_repo
+            clone_repo
             ;;
         venv)
             detect_os
             resolve_install_layout
             require_install_dir
-            payload_stage_runtimes
             install_uv
             check_python
             setup_venv
@@ -3393,7 +3212,6 @@ run_stage_body() {
             detect_os
             resolve_install_layout
             require_install_dir
-            payload_stage_runtimes
             install_uv
             check_python
             install_deps
@@ -3402,7 +3220,6 @@ run_stage_body() {
             detect_os
             resolve_install_layout
             require_install_dir
-            payload_stage_runtimes
             check_node
             install_node_deps
             ;;
@@ -3447,7 +3264,6 @@ run_stage_body() {
             resolve_install_layout
             print_success
             write_bootstrap_marker
-            write_install_mode_manifest
             # Code-scoped stamp: write next to the install tree, not into
             # $HERMES_HOME. $HERMES_HOME is a shared data dir (it can be
             # bind-mounted into a Docker gateway too), so a stamp there gets
@@ -3510,7 +3326,6 @@ main() {
 
     detect_os
     resolve_install_layout
-    payload_stage_runtimes
     install_uv
     check_python
     check_git
@@ -3518,7 +3333,7 @@ main() {
     check_network_prerequisites
     install_system_packages
 
-    payload_stage_repo || clone_repo
+    clone_repo
     setup_venv
     install_deps
     install_node_deps
@@ -3535,7 +3350,6 @@ main() {
     print_success
 
     write_bootstrap_marker
-    write_install_mode_manifest
 
     # Code-scoped stamp: write next to the install tree, not into $HERMES_HOME.
     # $HERMES_HOME is a shared data dir (it can be bind-mounted into a Docker

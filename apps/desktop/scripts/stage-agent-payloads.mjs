@@ -241,10 +241,9 @@ export function parseSkips(argv) {
 
 /**
  * Build the manifest that describes the contents of the payload tree.
- * `items` records per-item presence. Thus the --payload-dir stages of
- * install.sh/ps1 can fall back to their network path for each missing
- * item. A partly assembled payload degrades and does not fail the whole
- * bootstrap.
+ * `items` records per-item presence. Thus the resident-runtime gate in
+ * the Electron main process can require exactly the items it needs and
+ * refuse to run resident from an incomplete artifact.
  */
 export function buildManifest({ tag, commit, target, staged, skipped }) {
   const items = {}
