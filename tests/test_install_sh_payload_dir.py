@@ -51,8 +51,12 @@ log_success() {{ echo "OK: $*" >&2; }}
     )
 
 
-def make_payload(tmp_path, *, items=("repo",), tag="v0.1.0", commits=2):
-    """Build a payload dir shaped like stage-agent-payloads.mjs output."""
+def make_payload(tmp_path, *, items=("repo",), tag="v0.1.0", files=2):
+    """Build a payload dir shaped like stage-agent-payloads.mjs output.
+
+    The repo item is a PLAIN SOURCE TREE without .git — the exact shape
+    stageRepo produces via git archive.
+    """
     payload = tmp_path / "agent-payload"
     payload.mkdir(exist_ok=True)
     manifest = {
@@ -64,12 +68,11 @@ def make_payload(tmp_path, *, items=("repo",), tag="v0.1.0", commits=2):
     if "repo" in items:
         repo = payload / "repo"
         repo.mkdir()
-        _git(repo, "init", "-q", "-b", "main")
-        for i in range(commits):
+        for i in range(files):
             (repo / f"f{i}.txt").write_text(f"payload {i}\n")
-            _git(repo, "add", ".")
-            _git(repo, "-c", "user.email=t@t", "-c", "user.name=t",
-                 "commit", "-q", "-m", f"c{i}")
+        (repo / ".hermes_build_info.json").write_text(
+            json.dumps({"schemaVersion": 2, "tag": tag, "payload": True})
+        )
     return payload
 
 
@@ -119,39 +122,47 @@ class TestPayloadTag:
 
 
 class TestPayloadStageRepo:
-    def test_fresh_materialization_is_git_shaped(self, tmp_path):
-        """Fresh install: repo copied with .git so eject/update premises hold."""
+    def test_fresh_materialization_is_gitless(self, tmp_path):
+        """Fresh install: the payload tree is copied verbatim, no .git."""
         payload = make_payload(tmp_path)
         install_dir = tmp_path / "hermes-agent"
         r = run_payload_snippet(
             "payload_stage_repo", payload_dir=payload, install_dir=install_dir
         )
         assert r.returncode == 0, r.stderr
-        assert (install_dir / ".git").is_dir()
+        assert not (install_dir / ".git").exists()
         assert (install_dir / "f0.txt").read_text() == "payload 0\n"
-        payload_head = _git(payload / "repo", "rev-parse", "HEAD")
-        assert _git(install_dir, "rev-parse", "HEAD") == payload_head
+        # The build stamp travels with the tree — it is the version
+        # provenance that replaces git describe.
+        stamp = json.loads((install_dir / ".hermes_build_info.json").read_text())
+        assert stamp["payload"] is True
 
-    def test_existing_checkout_updated_via_file_fetch(self, tmp_path):
-        """Existing bundled checkout: fetched + hard-reset to payload HEAD, offline."""
-        payload = make_payload(tmp_path, commits=3)
+    def test_existing_checkout_replaced_but_runtime_dirs_kept(self, tmp_path):
+        """Existing bundled checkout: tree replaced in place, venv and
+        node_modules and .env survive, stale files and a legacy .git go."""
+        payload = make_payload(tmp_path, files=3)
         install_dir = tmp_path / "hermes-agent"
-        # Simulate an older bundled install: clone payload repo then rewind.
-        subprocess.run(
-            ["git", "clone", "-q", str(payload / "repo"), str(install_dir)],
-            check=True, capture_output=True,
-        )
-        _git(install_dir, "reset", "--hard", "-q", "HEAD~2")
-        assert not (install_dir / "f2.txt").exists()
+        install_dir.mkdir()
+        (install_dir / "stale.txt").write_text("old release file\n")
+        (install_dir / ".git").mkdir()
+        (install_dir / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+        (install_dir / "venv").mkdir()
+        (install_dir / "venv" / "marker").write_text("expensive\n")
+        (install_dir / "node_modules").mkdir()
+        (install_dir / "node_modules" / "marker").write_text("expensive\n")
+        (install_dir / ".env").write_text("SECRET=1\n")
 
         r = run_payload_snippet(
             "payload_stage_repo", payload_dir=payload, install_dir=install_dir
         )
         assert r.returncode == 0, r.stderr
         assert (install_dir / "f2.txt").exists()
-        assert _git(install_dir, "rev-parse", "HEAD") == _git(
-            payload / "repo", "rev-parse", "HEAD"
-        )
+        assert not (install_dir / "stale.txt").exists()
+        # A legacy checkout's .git is dropped: bundled checkouts are gitless.
+        assert not (install_dir / ".git").exists()
+        assert (install_dir / "venv" / "marker").read_text() == "expensive\n"
+        assert (install_dir / "node_modules" / "marker").read_text() == "expensive\n"
+        assert (install_dir / ".env").read_text() == "SECRET=1\n"
 
     def test_refuses_source_managed_checkout(self, tmp_path):
         """The eject contract: a source-mode checkout is never overwritten."""

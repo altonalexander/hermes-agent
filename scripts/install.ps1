@@ -4065,17 +4065,18 @@ function Invoke-PayloadStageRepository {
     $tag = Get-PayloadTag
     Write-Info "Materializing Hermes Agent from bundled payload ($tag)..."
     $payloadRepo = Join-Path $PayloadDir "repo"
-    if (Test-Path (Join-Path $InstallDir ".git")) {
-        $payloadHead = (& git -C $payloadRepo rev-parse HEAD 2>$null)
-        if (-not $payloadHead) { return $false }
-        & git -C $InstallDir fetch $payloadRepo HEAD 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { return $false }
-        & git -C $InstallDir checkout -B main $payloadHead 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { return $false }
-        & git -C $InstallDir reset --hard $payloadHead 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { return $false }
+    # The payload repo is a plain source tree with NO .git (bundled installs
+    # never run git against the checkout; eject makes its own fresh clone).
+    # Replace an existing checkout's tree but keep the expensive runtime
+    # dirs (wheels/js stages refresh them in place) and user secrets. The
+    # old .git of an adopted legacy checkout is dropped on purpose.
+    if (Test-Path $InstallDir) {
+        $keep = @("venv", "node_modules", ".env")
+        Get-ChildItem -Force -LiteralPath $InstallDir | Where-Object { $keep -notcontains $_.Name } | ForEach-Object {
+            Remove-Item -Recurse -Force -LiteralPath $_.FullName
+        }
+        Copy-Item -Recurse -Force (Join-Path $payloadRepo "*") $InstallDir
     } else {
-        if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir }
         $parent = Split-Path $InstallDir -Parent
         if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
         Copy-Item -Recurse $payloadRepo $InstallDir

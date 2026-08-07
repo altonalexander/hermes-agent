@@ -403,13 +403,15 @@ payload_refuses_source_checkout() {
     tr -d '\n\r\t ' < "$manifest" | grep -q '"installMode":"source"'
 }
 
-# payload_stage_repo: materializes the checkout from the payload's shallow
-# clone. The clone keeps .git, so the checkout stays git-shaped. Then eject
-# stays cheap and the premises of `hermes update` hold. Returns 1 to signal
-# "fall back".
+# payload_stage_repo: materializes the checkout from the payload's plain
+# source tree. The payload deliberately carries NO .git: bundled installs
+# never run git against the checkout (app updates replace the whole tree,
+# and `hermes update --eject` makes its own fresh clone). Version
+# provenance comes from the .hermes_build_info.json stamp inside the tree.
+# Returns 1 to signal "fall back".
 payload_stage_repo() {
     payload_has repo || return 1
-    if [ -d "$INSTALL_DIR/.git" ] || [ -d "$INSTALL_DIR" ]; then
+    if [ -d "$INSTALL_DIR" ]; then
         if payload_refuses_source_checkout; then
             log_info "Existing checkout is source-managed (ejected) — leaving it alone"
             # This success is deliberate. The user's own checkout satisfies
@@ -419,17 +421,23 @@ payload_stage_repo() {
     fi
     log_info "Materializing Hermes Agent from bundled payload ($(payload_tag))..."
     mkdir -p "$(dirname "$INSTALL_DIR")"
-    if [ -d "$INSTALL_DIR/.git" ]; then
-        # For an existing bundled or legacy checkout, fetch from the payload
-        # clone and hard-reset to its HEAD. The fetch uses the file protocol,
-        # not the network.
-        local payload_head
-        payload_head=$(git -C "$PAYLOAD_DIR/repo" rev-parse HEAD) || return 1
-        git -C "$INSTALL_DIR" fetch "$PAYLOAD_DIR/repo" HEAD || return 1
-        git -C "$INSTALL_DIR" checkout -B main "$payload_head" || return 1
-        git -C "$INSTALL_DIR" reset --hard "$payload_head" || return 1
+    if [ -d "$INSTALL_DIR" ]; then
+        # Replace an existing bundled or adopted-legacy checkout with the
+        # payload tree, but keep the expensive runtime dirs (the wheels and
+        # js stages refresh their content in place) and user secrets. The
+        # old .git of an adopted legacy checkout is dropped on purpose:
+        # a bundled checkout is gitless by design.
+        local keep entry
+        keep="venv node_modules .env"
+        for entry in "$INSTALL_DIR"/* "$INSTALL_DIR"/.[!.]*; do
+            [ -e "$entry" ] || continue
+            case " $keep " in
+                *" $(basename "$entry") "*) ;;
+                *) rm -rf "$entry" ;;
+            esac
+        done
+        cp -R "$PAYLOAD_DIR/repo/." "$INSTALL_DIR/" || return 1
     else
-        rm -rf "$INSTALL_DIR"
         cp -R "$PAYLOAD_DIR/repo" "$INSTALL_DIR" || return 1
     fi
     log_success "Checkout materialized offline at $(payload_tag)"

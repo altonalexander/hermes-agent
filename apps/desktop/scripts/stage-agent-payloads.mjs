@@ -289,15 +289,44 @@ function probe(cmd, args) {
 function stageRepo(tag, outDir) {
   const repoDir = path.join(outDir, "repo")
   fs.rmSync(repoDir, { recursive: true, force: true })
-  // Clone from the local checkout when it has the tag. Otherwise clone
-  // from origin. The clone is depth 1 at the tag. .git is kept on purpose.
-  run("git", [
-    "clone", "--depth", "1", "--branch", tag,
-    "--config", "remote.origin.url=https://github.com/NousResearch/hermes-agent.git",
-    REPO_ROOT, repoDir,
+  fs.mkdirSync(repoDir, { recursive: true })
+  const commit = execSync(`git rev-parse ${tag}^{commit}`, { cwd: REPO_ROOT, encoding: "utf8" }).trim()
+  const commitDate = execSync(`git log -1 --format=%ct ${tag}`, { cwd: REPO_ROOT, encoding: "utf8" }).trim()
+  // The payload repo is a PLAIN SOURCE TREE, deliberately without .git.
+  // Bundled installs never run git against the checkout: updates replace
+  // the whole tree (electron-updater), and `hermes update --eject` makes
+  // its own fresh clone. A shipped .git also broke in transit: `git gc`
+  // packs all refs, which leaves .git/refs/ empty, and electron-builder's
+  // resource copy drops empty directories — git then refuses to recognize
+  // the repository at all. git archive gives a clean tree of exactly the
+  // tag's tracked files.
+  const archive = path.join(outDir, ".repo-archive.tar")
+  run("git", ["archive", "--format=tar", "-o", archive, tag], { cwd: REPO_ROOT })
+  run(hostTarBin(), ["-xf", archive, "-C", repoDir])
+  fs.rmSync(archive, { force: true })
+  // Version provenance without git: the schema-v2 build stamp. The
+  // version_info ladder prefers this stamp over git probing, so bundled
+  // installs report exact-release provenance (distance 0, the tag's
+  // commit) with no .git present.
+  run("python3", [
+    path.join(repoDir, "scripts", "write_install_stamp.py"),
+    "--output", path.join(repoDir, ".hermes_build_info.json"),
+    "--commit", commit,
+    "--commit-date", commitDate,
+    "--base-version", tag.slice(1),
+    "--distance", "0",
+    "--source", "ci",
   ])
-  run("git", ["-C", repoDir, "gc", "--aggressive", "--prune=now"])
-  return execSync(`git -C ${JSON.stringify(repoDir)} rev-parse HEAD`, { encoding: "utf8" }).trim()
+  return commit
+}
+
+// Windows: name System32's bsdtar by full path. A GNU tar earlier on
+// PATH (Git bash on the GitHub runners) reads "C:" in a path as a
+// remote host name. bsdtar also has the --zstd support js-prebuilt needs.
+function hostTarBin() {
+  return process.platform === "win32"
+    ? path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe")
+    : "tar"
 }
 
 function stageUvAndPython(target, outDir) {
@@ -498,14 +527,7 @@ function stageJsPrebuilt(outDir) {
     throw new Error("no prebuilt JS surfaces found — run the ui-tui/web builds first")
   }
   fs.writeFileSync(listFile, candidates.join("\n") + "\n")
-  // Windows: name System32's bsdtar by full path. A GNU tar earlier on
-  // PATH (Git bash on the GitHub runners) reads "C:" in a path as a
-  // remote host name. bsdtar also has the --zstd support this needs.
-  const tarBin =
-    process.platform === "win32"
-      ? path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe")
-      : "tar"
-  run(tarBin, [
+  run(hostTarBin(), [
     "--zstd", "-cf", path.join(outDir, "js-prebuilt.tar.zst"),
     "-C", REPO_ROOT, "-T", listFile,
   ])

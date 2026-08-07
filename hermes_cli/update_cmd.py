@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -3765,12 +3766,18 @@ def _normalize_managed_eol(git_cmd, repo_root):
 def cmd_update_eject(args) -> int:
     """Implement ``hermes update --eject``.
 
-    This function changes a desktop-bundled checkout to source management. It
-    unshallows the git history, because bundled payload clones are depth-1. It
-    fetches the tags. It rewrites the install manifest to ``installMode:
-    source`` with the selected channel. After this, ``hermes update`` owns the
-    checkout. The bootstrap of the desktop app then skips its agent stages,
-    because it refuses to overwrite a source-mode checkout.
+    This function changes a desktop-bundled checkout to source management.
+    Bundled checkouts are plain source trees without ``.git`` (app updates
+    replace the whole tree, so the payload ships no repository). The eject
+    grafts a real git repository onto the checkout in place: ``git init``,
+    then a fetch of the pinned release tag and of ``main``, then a forced
+    checkout of the pinned tag. The working tree already matches the tag,
+    so the forced checkout changes nothing except git's own metadata. The
+    venv and node_modules stay untouched. It rewrites the install manifest
+    to ``installMode: source`` with the selected channel. After this,
+    ``hermes update`` owns the checkout. The bootstrap of the desktop app
+    then skips its agent stages, because it refuses to overwrite a
+    source-mode checkout.
 
     Returns a process exit code.
     """
@@ -3810,9 +3817,9 @@ def cmd_update_eject(args) -> int:
             print("  (Only desktop-bundled installs need an eject.)")
         return 0
 
-    git_dir = project_root / ".git"
-    if not git_dir.exists():
-        print("✗ An eject is not possible. This checkout is not a git repository.")
+    pinned_tag = manifest.get("pinnedTag") or ""
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", pinned_tag):
+        print("✗ An eject is not possible. The install manifest has no valid pinned tag.")
         print("  Reinstall from source instead:")
         print("  curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash")
         return 1
@@ -3821,34 +3828,57 @@ def cmd_update_eject(args) -> int:
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
-    is_shallow = (
-        subprocess.run(
-            git_cmd + ["rev-parse", "--is-shallow-repository"],
+    git_dir = project_root / ".git"
+    print("⚕ Hermes ejects this install from desktop-managed updates...")
+
+    def _git(step_args: list, failure: str):
+        result = subprocess.run(
+            git_cmd + step_args,
             cwd=project_root,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
-        ).stdout.strip()
-        == "true"
-    )
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            print(f"✗ {failure}. Hermes aborted the eject.")
+            if stderr:
+                print(f"  {stderr.splitlines()[0]}")
+            return False
+        return True
 
-    print("⚕ Hermes ejects this install from desktop-managed updates...")
-    fetch_args = ["fetch", "--tags", "origin"]
-    if is_shallow:
-        print("→ Hermes fetches the full git history (this can take a minute)...")
-        fetch_args.insert(1, "--unshallow")
-    else:
-        print("→ Hermes fetches the tags...")
-    fetch_result = subprocess.run(
-        git_cmd + fetch_args,
-        cwd=project_root,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
+    fresh_git = not git_dir.exists()
+    if fresh_git:
+        if not _git(["init", "--initial-branch", "main"], "git init failed"):
+            return 1
+        if not _git(
+            ["remote", "add", "origin", OFFICIAL_REPO_URL],
+            "git remote add failed",
+        ):
+            return 1
+
+    print(f"→ Hermes fetches the release tag {pinned_tag} and main (this can take a minute)...")
+    fetched = _git(
+        ["fetch", "--depth", "1", "origin",
+         f"+refs/tags/{pinned_tag}:refs/tags/{pinned_tag}",
+         "+refs/heads/main:refs/remotes/origin/main"],
+        "git fetch failed. The install is unchanged",
     )
-    if fetch_result.returncode != 0:
-        stderr = (fetch_result.stderr or "").strip()
-        print("✗ git fetch failed. Hermes aborted the eject. The install is unchanged.")
-        if stderr:
-            print(f"  {stderr.splitlines()[0]}")
+    if not fetched:
+        if fresh_git:
+            # Leave no half-initialized repository behind: a later eject
+            # retry must start clean, and bundled mode treats .git as
+            # foreign matter.
+            shutil.rmtree(git_dir, ignore_errors=True)
+        return 1
+
+    # The working tree already holds the tag's files (the payload staged
+    # them). The forced checkout only makes git agree with reality.
+    if not _git(
+        ["checkout", "-f", "-B", "main", f"tags/{pinned_tag}"],
+        "git checkout failed",
+    ):
+        if fresh_git:
+            shutil.rmtree(git_dir, ignore_errors=True)
         return 1
 
     manifest["installMode"] = MODE_SOURCE

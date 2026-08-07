@@ -1,14 +1,17 @@
 """Tests for ``hermes update --eject`` (hermes_cli/update_cmd.py::cmd_update_eject).
 
-Uses real git repos (not mocks) per the repo's E2E-validation preference:
-a local "origin" plus a depth-1 clone reproduce exactly what a bundled
-desktop payload checkout looks like.
+Uses real git repos (not mocks) per the repo's E2E-validation preference.
+A bundled checkout is a PLAIN SOURCE TREE without ``.git`` (the desktop
+payload ships no repository), so the fixtures build one from a local
+"origin" via ``git archive``, and eject grafts a fresh repository onto it
+by fetching from that origin.
 """
 
 import subprocess
 
 import pytest
 
+import hermes_cli.update_cmd as update_cmd
 from hermes_cli.install_manifest import (
     CHANNEL_MAIN,
     CHANNEL_STABLE,
@@ -32,28 +35,46 @@ def _git(cwd, *args):
 
 
 @pytest.fixture
-def bundled_checkout(tmp_path):
-    """A depth-1 clone of a local origin, manifest-marked as bundled."""
+def origin(tmp_path):
+    """A local origin with three commits and a v0.1.0 tag on main."""
     origin = tmp_path / "origin"
     origin.mkdir()
     _git(origin, "init", "-b", "main")
     _git(origin, "config", "user.email", "test@example.com")
     _git(origin, "config", "user.name", "test")
+    # The real repository ignores the manifest and stamp in the checkout
+    # root; the fixture mirrors that so post-eject `git status` contracts
+    # match production.
+    (origin / ".gitignore").write_text("/.hermes-install.json\n/.hermes_build_info.json\n")
     for i in range(3):
         (origin / f"f{i}.txt").write_text(f"content {i}\n")
         _git(origin, "add", ".")
         _git(origin, "commit", "-m", f"commit {i}")
     _git(origin, "tag", "v0.1.0")
+    return origin
 
+
+@pytest.fixture
+def bundled_checkout(tmp_path, origin, monkeypatch):
+    """A gitless source tree at v0.1.0, manifest-marked as bundled.
+
+    This is exactly the shape payload_stage_repo materializes: the tag's
+    tracked files, no .git. Eject fetches from OFFICIAL_REPO_URL, which the
+    fixture points at the local origin.
+    """
     checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    archive = tmp_path / "repo.tar"
+    _git(origin, "archive", "--format=tar", "-o", str(archive), "v0.1.0")
     subprocess.run(
-        ["git", "clone", "--depth", "1", f"file://{origin}", str(checkout)],
-        capture_output=True, text=True, check=True,
+        ["tar", "-xf", str(archive), "-C", str(checkout)],
+        capture_output=True, check=True,
     )
     write_install_manifest(
         {"installMode": MODE_BUNDLED, "channel": CHANNEL_STABLE, "pinnedTag": "v0.1.0"},
         checkout,
     )
+    monkeypatch.setattr(update_cmd, "OFFICIAL_REPO_URL", f"file://{origin}")
     return checkout
 
 
@@ -70,14 +91,21 @@ def _patch_project_root(monkeypatch, root):
 
 
 class TestEjectBundled:
-    def test_eject_unshallows_and_flips_mode(self, bundled_checkout, monkeypatch, capsys):
+    def test_eject_grafts_git_and_flips_mode(self, bundled_checkout, monkeypatch, capsys):
         _patch_project_root(monkeypatch, bundled_checkout)
-        assert _git(bundled_checkout, "rev-parse", "--is-shallow-repository") == "true"
+        assert not (bundled_checkout / ".git").exists()
 
         rc = cmd_update_eject(_Args())
 
         assert rc == 0
-        assert _git(bundled_checkout, "rev-parse", "--is-shallow-repository") == "false"
+        # A real repository now exists, at the pinned tag, on main.
+        assert (bundled_checkout / ".git").is_dir()
+        assert _git(bundled_checkout, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+        assert _git(bundled_checkout, "rev-parse", "HEAD") == _git(
+            bundled_checkout, "rev-parse", "tags/v0.1.0^{commit}"
+        )
+        # The graft changed no tracked file: the tree already matched the tag.
+        assert _git(bundled_checkout, "status", "--porcelain") == ""
         manifest = read_install_manifest(bundled_checkout)
         assert manifest["installMode"] == MODE_SOURCE
         assert manifest["channel"] == CHANNEL_MAIN  # default eject channel
@@ -86,9 +114,6 @@ class TestEjectBundled:
         assert is_ejected(bundled_checkout)
         # Provenance pin survives for forensics.
         assert manifest["pinnedTag"] == "v0.1.0"
-        # Full history + tags are now available.
-        assert _git(bundled_checkout, "rev-list", "--count", "HEAD") == "3"
-        assert "v0.1.0" in _git(bundled_checkout, "tag", "--list")
         assert "Ejected" in capsys.readouterr().out
 
     def test_eject_with_stable_channel(self, bundled_checkout, monkeypatch):
@@ -97,20 +122,25 @@ class TestEjectBundled:
         assert rc == 0
         assert read_install_manifest(bundled_checkout)["channel"] == CHANNEL_STABLE
 
-    def test_failed_fetch_leaves_manifest_untouched(self, bundled_checkout, monkeypatch, capsys):
-        """Eject must be atomic-ish: no mode flip if git fetch fails."""
+    def test_failed_fetch_leaves_manifest_and_tree_untouched(
+        self, bundled_checkout, monkeypatch, capsys
+    ):
+        """Eject must be atomic-ish: no mode flip, no leftover .git on failure."""
         _patch_project_root(monkeypatch, bundled_checkout)
-        _git(bundled_checkout, "remote", "set-url", "origin", "file:///nonexistent/repo")
+        monkeypatch.setattr(update_cmd, "OFFICIAL_REPO_URL", "file:///nonexistent/repo")
 
         rc = cmd_update_eject(_Args())
 
         assert rc == 1
         manifest = read_install_manifest(bundled_checkout)
         assert manifest["installMode"] == MODE_BUNDLED
+        # A half-initialized repository must not survive: the next eject
+        # retry starts clean, and bundled mode treats .git as foreign.
+        assert not (bundled_checkout / ".git").exists()
         assert "aborted" in capsys.readouterr().out
 
-    def test_missing_git_dir_refuses(self, tmp_path, monkeypatch, capsys):
-        root = tmp_path / "nogit"
+    def test_missing_pinned_tag_refuses(self, tmp_path, monkeypatch, capsys):
+        root = tmp_path / "notag"
         root.mkdir()
         write_install_manifest(
             {"installMode": MODE_BUNDLED, "channel": CHANNEL_STABLE}, root
@@ -121,7 +151,23 @@ class TestEjectBundled:
 
         assert rc == 1
         assert read_install_manifest(root)["installMode"] == MODE_BUNDLED
-        assert "not a git repository" in capsys.readouterr().out
+        assert "no valid pinned tag" in capsys.readouterr().out
+
+    def test_eject_with_preexisting_git_keeps_it(self, bundled_checkout, origin, monkeypatch):
+        """A checkout that somehow already has .git (legacy adopted install)
+        ejects through the same path without re-initializing."""
+        _patch_project_root(monkeypatch, bundled_checkout)
+        _git(bundled_checkout, "init", "-b", "main")
+        _git(bundled_checkout, "remote", "add", "origin", f"file://{origin}")
+
+        rc = cmd_update_eject(_Args())
+
+        assert rc == 0
+        manifest = read_install_manifest(bundled_checkout)
+        assert manifest["installMode"] == MODE_SOURCE
+        assert _git(bundled_checkout, "rev-parse", "HEAD") == _git(
+            bundled_checkout, "rev-parse", "tags/v0.1.0^{commit}"
+        )
 
 
 class TestEjectOnSourceInstalls:

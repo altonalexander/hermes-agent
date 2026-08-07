@@ -53,7 +53,11 @@ function capture(cmd) {
 
 // ── 1. preflight ────────────────────────────────────────────────────────────
 
-for (const tool of ["uv", "git", "npm", "tar"]) {
+// GNU tar and macOS bsdtar both run an external `zstd` binary for --zstd,
+// which payload staging uses for js-prebuilt.tar.zst. Windows System32
+// bsdtar carries libzstd built in, so the probe list skips zstd there.
+const preflightTools = ["uv", "git", "npm", "tar", ...(process.platform === "win32" ? [] : ["zstd"])]
+for (const tool of preflightTools) {
   const probe = spawnSync(tool, ["--version"], { stdio: "ignore", shell: process.platform === "win32" })
   if (probe.status !== 0) {
     fail(`required tool missing: ${tool}`)
