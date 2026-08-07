@@ -51,6 +51,14 @@ jobs:
   build:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
+    # The signing secrets and variables live in this environment, not at
+    # repo level. Its deployment policy (main + v* tags) decides which
+    # refs may receive them. Refs outside the policy fail at job start,
+    # so a workflow_dispatch against a work branch cannot reach the
+    # secrets at all. On repos without the environment, GitHub treats it
+    # as unprotected-and-empty: jobs run, secrets resolve blank, and the
+    # build stays unsigned — the fork/dry-run behavior is unchanged.
+    environment: release-signing
     timeout-minutes: 90
     strategy:
       fail-fast: false
