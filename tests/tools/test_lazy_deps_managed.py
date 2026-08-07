@@ -88,7 +88,7 @@ def test_docker_says_the_image_is_probably_at_fault(monkeypatch):
     monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
     monkeypatch.setattr("hermes_cli.config.get_managed_system", lambda: None)
 
-    message = lazy_deps._managed_install_reason(FEATURE, "some-extra")
+    message = lazy_deps.managed_install_reason(FEATURE, "some-extra")
     assert "HERMES_DISABLE_LAZY_INSTALLS" in message
     assert "bug in the image build" in message
     assert "uv pip install" not in message
@@ -103,7 +103,7 @@ def test_package_manager_wins_over_the_sealed_flag(monkeypatch):
     monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
     monkeypatch.setattr("hermes_cli.config.get_managed_system", lambda: "NixOS")
 
-    message = lazy_deps._managed_install_reason(FEATURE, "some-extra")
+    message = lazy_deps.managed_install_reason(FEATURE, "some-extra")
     assert "services.hermes-agent.extraDependencyGroups" in message
     assert "image build" not in message
 

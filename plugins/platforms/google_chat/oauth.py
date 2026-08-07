@@ -412,11 +412,11 @@ def install_deps() -> bool:
         # No pyproject.toml on disk, or no [google-chat] extra. A managed
         # install (NixOS) reaches this, and its store is read-only, so an
         # install here cannot succeed. Report the remedy for the deployment.
-        from tools.lazy_deps import _managed_install_reason
+        from tools.lazy_deps import managed_install_reason
 
         print(
             "ERROR: cannot install the Google Chat dependencies: "
-            + _managed_install_reason("platform.google_chat", _EXTRA_NAME)
+            + managed_install_reason("platform.google_chat", _EXTRA_NAME)
         )
         return False
 

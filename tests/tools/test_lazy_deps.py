@@ -181,13 +181,82 @@ class TestActiveFeatures:
 
     def test_shared_dependency_does_not_activate_feature(self, monkeypatch):
         # asyncpg is a generic dependency that may be installed for unrelated
-        # reasons. It must not make hermes update try to refresh Matrix unless
-        # the Matrix anchor package (mautrix) is present.
+        # reasons. Even with Matrix in the record (used once, then removed),
+        # asyncpg's presence must not stand in for the Matrix anchor
+        # (mautrix) on hermes update.
+        ld._write_feature_record({"platform.matrix"})
         monkeypatch.setattr(
             ld, "_is_present",
             lambda spec: ld._pkg_name_from_spec(spec) == "asyncpg",
         )
         assert "platform.matrix" not in ld.active_features()
+
+    def test_a_composed_helper_does_not_activate_its_siblings(self, monkeypatch):
+        """sounddevice is in every audio extra, via [audio-io].
+
+        The regression: extra_specs expands references first, so specs[0]
+        of [voice] and of each wake engine was sounddevice, and one local
+        STT install marked all of them active. `hermes update` then
+        installed ~500MB of wake engines the user never asked for.
+
+        Recording every feature makes the point sharper: even with each
+        audio feature in the record, only the one whose anchor is installed
+        counts as active.
+        """
+        ld._write_feature_record(
+            {"stt.faster_whisper", "wake.openwakeword", "wake.sherpa",
+             "wake.porcupine"}
+        )
+        monkeypatch.setattr(
+            ld, "_is_present",
+            lambda spec: ld._pkg_name_from_spec(spec) in {
+                "sounddevice", "numpy", "faster-whisper",
+            },
+        )
+        active = ld.active_features()
+        assert "stt.faster_whisper" in active
+        assert [f for f in active if f.startswith("wake.")] == []
+
+    def test_ensure_records_the_feature(self, monkeypatch):
+        """A satisfied ensure() must land the feature in the record file.
+
+        The record is the primary signal: it says which backends the user
+        runs, where package presence can only say which packages exist.
+        """
+        _register_fake_feature(monkeypatch, "test.recorded", ("pkgx==1.0",))
+        monkeypatch.setattr(ld, "_is_satisfied", lambda spec: True)
+        ld.ensure("test.recorded", prompt=False)
+        assert "test.recorded" in ld._read_feature_record()
+
+    def test_a_recorded_feature_needs_its_anchor_installed(self, monkeypatch):
+        """The record alone must not resurrect an uninstalled backend."""
+        _register_fake_feature(monkeypatch, "test.gone", ("pkgy==1.0",))
+        ld._write_feature_record({"test.gone"})
+        monkeypatch.setattr(ld, "_is_present", lambda spec: False)
+        assert "test.gone" not in ld.active_features()
+
+    def test_an_absent_record_means_nothing_is_active(self, monkeypatch):
+        """No seeding. An install that predates the record refreshes nothing
+        on its first update; ensure() at backend start repairs stale pins
+        and records the feature, so the next update covers it.
+        """
+        monkeypatch.setattr(
+            ld, "_is_present",
+            lambda spec: ld._pkg_name_from_spec(spec) == "mautrix",
+        )
+        assert not ld._feature_record_path().exists()
+        assert ld.active_features() == []
+        # Reading must not create the file either.
+        assert not ld._feature_record_path().exists()
+
+    def test_a_corrupt_record_counts_as_empty(self, monkeypatch):
+        ld._feature_record_path().parent.mkdir(parents=True, exist_ok=True)
+        ld._feature_record_path().write_text("not json", encoding="utf-8")
+        monkeypatch.setattr(
+            ld, "_is_present",
+            lambda spec: ld._pkg_name_from_spec(spec) == "mautrix",
+        )
+        assert ld.active_features() == []
 
 
 class TestRefreshActiveFeatures:

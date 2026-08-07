@@ -58,6 +58,7 @@ Adding a new backend:
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 import re
@@ -243,6 +244,41 @@ def extra_specs(extra: str, _seen: Optional[frozenset] = None) -> tuple[str, ...
     return tuple(out)
 
 
+def _anchor_spec(extra: str, _seen: Optional[frozenset] = None) -> Optional[str]:
+    """Return the spec that identifies ``extra``: its first direct pin.
+
+    ``extra_specs`` expands ``hermes-agent[...]`` references in place, so
+    its first element can be a shared helper from a composed extra —
+    ``[voice]`` starts with ``hermes-agent[audio-io]``, and expansion puts
+    ``sounddevice`` first. sounddevice is in every audio extra, so it
+    identifies none of them. The pin that identifies an extra is the first
+    one written directly in it (``faster-whisper`` for ``[voice]``).
+
+    Only when an extra holds nothing but references (``[computer-use]`` is
+    ``hermes-agent[mcp]`` alone) does this recurse into the first reference.
+    """
+    seen = _seen or frozenset()
+    if extra in seen:
+        return None
+    table = _optional_dependencies()
+    if extra not in table:
+        return None
+    seen = seen | {extra}
+
+    refs: list[str] = []
+    for spec in table[extra]:
+        m = _SELF_REF.match(spec)
+        if m:
+            refs.extend(sub.strip() for sub in m.group(1).split(","))
+        else:
+            return spec
+    for ref in refs:
+        found = _anchor_spec(ref, seen)
+        if found:
+            return found
+    return None
+
+
 class FeatureUnavailable(RuntimeError):
     """A lazily-installable feature is missing and cannot be made available.
 
@@ -426,7 +462,7 @@ def activate_durable_lazy_target() -> None:
 _CONFIG_DISABLED_REASON = "lazy installs disabled (security.allow_lazy_installs=false)"
 
 
-def _managed_install_reason(feature: str, extra: Optional[str] = None) -> str:
+def managed_install_reason(feature: str, extra: Optional[str] = None) -> str:
     """Return the message for an install that this deployment cannot run.
 
     Each caller reaches this when Hermes cannot install a package at run
@@ -435,6 +471,9 @@ def _managed_install_reason(feature: str, extra: Optional[str] = None) -> str:
 
     ``extra`` is the pyproject extra that holds the packages, when the
     caller knows it. The NixOS remedy needs that name.
+
+    Public on purpose: plugin setup flows (google_chat, honcho) report the
+    same remedies when their own install paths cannot run.
     """
     # Check the package manager first. A managed install can also carry
     # HERMES_DISABLE_LAZY_INSTALLS, and the remedy for that user is the
@@ -492,7 +531,7 @@ def _sealed_venv_reason() -> Optional[str]:
     """Return why a sealed deployment refuses an install, or None."""
     if os.environ.get("HERMES_DISABLE_LAZY_INSTALLS") != "1":
         return None
-    return _managed_install_reason("", None)
+    return managed_install_reason("", None)
 
 
 def _allow_lazy_installs() -> bool:
@@ -601,11 +640,13 @@ def _is_satisfied(spec: str) -> bool:
     if req.marker is not None and not req.marker.evaluate():
         return True
 
-    from importlib.metadata import PackageNotFoundError, version
+    from importlib.metadata import version
 
     try:
         installed = version(req.name)
-    except (PackageNotFoundError, Exception):
+    except Exception:
+        # PackageNotFoundError is the normal miss; anything else (broken
+        # dist-info metadata) also means "not usable, reinstall".
         return False
     return req.specifier.contains(installed, prereleases=True)
 
@@ -1049,6 +1090,9 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
 
     missing = feature_missing(feature)
     if not missing:
+        # The backend is in use with everything installed. Record the use,
+        # so `hermes update` refreshes this feature when a pin moves.
+        _record_feature_use(feature)
         return
 
     unsupported = _unsupported_feature_reason(feature)
@@ -1074,7 +1118,7 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
             raise FeatureUnavailable(
                 feature, missing,
                 "unsupported on a managed install: "
-                + _managed_install_reason(feature, LAZY_DEPS.get(feature)),
+                + managed_install_reason(feature, LAZY_DEPS.get(feature)),
                 # The store is read-only. A `uv pip install` hint here
                 # fails with EROFS.
                 actionable=False,
@@ -1162,6 +1206,7 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
         )
 
     logger.info("Lazy install complete for feature %r", feature)
+    _record_feature_use(feature)
 
 
 def is_available(feature: str) -> bool:
@@ -1283,30 +1328,83 @@ def install_specs(specs: list[str] | tuple[str, ...], *, timeout: int = 300) -> 
 
 
 def active_features() -> list[str]:
-    """Return the list of features the user has ever lazy-installed.
+    """Return the list of features the user has lazy-installed and still has.
 
-    A feature counts as "active" if its anchor package (the first declared
-    spec) is currently installed in the venv (presence check, ignoring
-    version). We intentionally do NOT treat shared helper packages as proof
-    that a backend was enabled: for example ``platform.matrix`` depends on
-    generic packages like ``asyncpg``/``aiosqlite`` that can be installed for
-    unrelated reasons, while the actual Matrix adapter anchor is ``mautrix``.
-    Features the user has never enabled stay quiet.
+    The primary signal is the record file (:func:`_record_feature_use`).
+    ``ensure`` writes a feature's name there on every call, and each backend
+    calls ``ensure`` at start, so the record names exactly the features in
+    use. A package check cannot do that: the extras share packages
+    (sounddevice is in every audio extra), so presence of a package does not
+    say which feature the user enabled.
+
+    A recorded feature still needs its anchor package installed to count.
+    The record says "used at some point"; a user who uninstalled the
+    packages since then must not get them back on ``hermes update``.
+
+    An install that predates the record has an empty one, so its first
+    ``hermes update`` refreshes nothing. That is fine: ``ensure`` runs at
+    each backend's start, repairs a stale pin there, and records the
+    feature, so the next update refreshes it.
 
     Used by ``hermes update`` to figure out which lazy backends need a
-    refresh pass when pins move in :data:`LAZY_DEPS`.
+    refresh pass when pins move in pyproject.toml.
     """
-    active = []
-    for feature in LAZY_DEPS:
-        try:
-            specs = feature_specs(feature)
-        except FeatureUnavailable:
-            # Extra missing from pyproject (stripped install) — the feature
-            # can't be refreshed, and it certainly isn't active.
-            continue
-        if specs and _is_present(specs[0]):
-            active.append(feature)
-    return active
+    recorded = _read_feature_record()
+    return [
+        f for f in LAZY_DEPS if f in recorded and _feature_anchor_present(f)
+    ]
+
+
+def _feature_anchor_present(feature: str) -> bool:
+    """Is the anchor package of ``feature`` installed, at any version?"""
+    anchor = _anchor_spec(LAZY_DEPS[feature])
+    return anchor is not None and _is_present(anchor)
+
+
+# The record of the features that ensure() has served. One name per line
+# in a JSON list, in $HERMES_HOME, so it survives a venv rebuild and, in a
+# container, lives on the data volume.
+_FEATURE_RECORD_NAME = "lazy-features.json"
+
+
+def _feature_record_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / _FEATURE_RECORD_NAME
+
+
+def _read_feature_record() -> set[str]:
+    """Return the recorded feature names.
+
+    A record that is absent or does not parse counts as empty, so a corrupt
+    file heals on the next write instead of raising forever.
+    """
+    try:
+        raw = json.loads(_feature_record_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    if not isinstance(raw, list):
+        return set()
+    return {str(f) for f in raw}
+
+
+def _write_feature_record(features: set[str]) -> None:
+    """Write the record. A failure only costs the record, so never raise."""
+    try:
+        path = _feature_record_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(sorted(features), indent=0) + "\n", encoding="utf-8"
+        )
+    except OSError as e:
+        logger.debug("Could not write the lazy-feature record: %s", e)
+
+
+def _record_feature_use(feature: str) -> None:
+    """Add ``feature`` to the record of features that ensure() has served."""
+    recorded = _read_feature_record()
+    if feature not in recorded:
+        _write_feature_record(recorded | {feature})
 
 
 def refresh_active_features(*, prompt: bool = False) -> dict[str, str]:

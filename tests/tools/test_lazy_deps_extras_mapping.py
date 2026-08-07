@@ -94,3 +94,62 @@ class TestExtraComposition:
             "pkg-a==1.0; platform_system == 'Darwin'",
             "pkg-c==3.0",
         }
+
+
+class TestAnchorSpec:
+    """The anchor identifies an extra. A shared helper cannot do that.
+
+    active_features() seeds its record from the anchors, so a wrong anchor
+    turns `hermes update` into an installer for backends the user never
+    enabled. The regression this guards: [voice] listed
+    `hermes-agent[audio-io]` first, expansion put sounddevice at index 0,
+    and one sounddevice install marked every audio feature active.
+    """
+
+    def test_the_anchor_is_the_first_direct_pin(self, monkeypatch):
+        monkeypatch.setattr(ld, "_optional_dependencies", lambda: {
+            "voice": ("hermes-agent[shared]", "the-real-engine==1.0"),
+            "shared": ("helper==1.0",),
+        })
+        assert ld._anchor_spec("voice") == "the-real-engine==1.0"
+
+    def test_a_reference_only_extra_recurses(self, monkeypatch):
+        monkeypatch.setattr(ld, "_optional_dependencies", lambda: {
+            "outer": ("hermes-agent[inner]",),
+            "inner": ("real-pkg==1.0",),
+        })
+        assert ld._anchor_spec("outer") == "real-pkg==1.0"
+
+    def test_a_cycle_returns_none(self, monkeypatch):
+        monkeypatch.setattr(ld, "_optional_dependencies", lambda: {
+            "a": ("hermes-agent[b]",),
+            "b": ("hermes-agent[a]",),
+        })
+        assert ld._anchor_spec("a") is None
+
+    def test_every_feature_has_an_anchor(self):
+        missing = [
+            f for f in ld.LAZY_DEPS if ld._anchor_spec(ld.LAZY_DEPS[f]) is None
+        ]
+        assert not missing, f"features with no anchor: {missing}"
+
+    def test_anchors_identify_their_extras(self):
+        """Two features with different extras must have different anchors.
+
+        Two features that map to one extra (stt.mistral and tts.mistral)
+        share an anchor by design: one install serves both. Across extras,
+        a shared anchor means presence of one package activates a feature
+        the user never enabled.
+        """
+        anchor_to_extra: dict[str, str] = {}
+        for extra in set(ld.LAZY_DEPS.values()):
+            anchor = ld._anchor_spec(extra)
+            assert anchor is not None
+            name = ld._pkg_name_from_spec(anchor)
+            other = anchor_to_extra.get(name)
+            assert other is None or other == extra, (
+                f"extras [{extra}] and [{other}] share the anchor package "
+                f"{name!r} — active_features cannot tell them apart. Put a "
+                f"distinctive pin first in each extra."
+            )
+            anchor_to_extra[name] = extra
