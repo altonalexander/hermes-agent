@@ -3856,11 +3856,10 @@ def cmd_update_eject(args) -> int:
         ):
             return 1
 
-    print(f"→ Hermes fetches the release tag {pinned_tag} and main (this can take a minute)...")
+    print(f"→ Hermes fetches the release tag {pinned_tag} (this can take a minute)...")
     fetched = _git(
         ["fetch", "--depth", "1", "origin",
-         f"+refs/tags/{pinned_tag}:refs/tags/{pinned_tag}",
-         "+refs/heads/main:refs/remotes/origin/main"],
+         f"+refs/tags/{pinned_tag}:refs/tags/{pinned_tag}"],
         "git fetch failed. The install is unchanged",
     )
     if not fetched:
@@ -3870,6 +3869,17 @@ def cmd_update_eject(args) -> int:
             # foreign matter.
             shutil.rmtree(git_dir, ignore_errors=True)
         return 1
+
+    # Best-effort: seed the origin/main tracking ref so the first
+    # `hermes update` after the eject starts from a known state. Its
+    # absence is harmless — update runs its own fetch.
+    subprocess.run(
+        git_cmd + ["fetch", "--depth", "1", "origin",
+                   "+refs/heads/main:refs/remotes/origin/main"],
+        cwd=project_root,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
 
     # The working tree already holds the tag's files (the payload staged
     # them). The forced checkout only makes git agree with reality.
