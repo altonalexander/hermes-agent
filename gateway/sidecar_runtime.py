@@ -72,6 +72,10 @@ def deps_are_current(sidecar_dir: Path) -> bool:
 
     False when either file is absent or unreadable, so a first run and an odd
     filesystem both resolve to "install needed" rather than to an error.
+
+    ``plugins.platforms.photon.adapter._sidecar_deps_stale`` reads the same
+    two files with the opposite missing-file answer, on purpose: there the
+    missing case belongs to ``sidecar_deps_installed``.
     """
     lockfile = sidecar_dir / "package-lock.json"
     marker = sidecar_dir / _DEPS_DIR / _INSTALL_MARKER
