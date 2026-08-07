@@ -512,9 +512,21 @@ def _ensure_sdk_installed() -> bool:
     # Resolve the pin from the [honcho] extra rather than hardcoding it here,
     # so bumping the version (or a CVE floor) is a one-line pyproject edit
     # instead of four string literals that can drift apart silently.
-    from tools.lazy_deps import extra_specs, install_specs
+    #
+    # No fallback spec. An unpinned `honcho-ai` install accepts whatever
+    # PyPI serves, which is the supply-chain hole this resolution exists to
+    # close. Empty specs mean pyproject.toml is not readable here, and that
+    # is a managed install, where a pip install cannot succeed anyway.
+    from tools.lazy_deps import extra_specs, install_specs, managed_install_reason
 
-    specs = list(extra_specs("honcho")) or ["honcho-ai"]
+    specs = list(extra_specs("honcho"))
+    if not specs:
+        print(
+            "  Cannot install honcho-ai: "
+            + managed_install_reason("memory.honcho", "honcho")
+            + "\n"
+        )
+        return False
     shown = " ".join(specs)
 
     print("  honcho-ai is not installed.")
