@@ -4009,8 +4009,8 @@ function Stage-Node             {
 function Stage-SystemPackages   { Install-SystemPackages }
 function Stage-Repository       { if (-not (Invoke-PayloadStageRepository)) { Install-Repository } }
 function Stage-Venv             { Resolve-UvCmd; Install-Venv }
-function Stage-Dependencies     { Resolve-UvCmd; if (-not (Invoke-PayloadStageWheels)) { Install-Dependencies } }
-function Stage-NodeDeps         { if (-not (Invoke-PayloadStageJs)) { Install-NodeDeps } }
+function Stage-Dependencies     { Resolve-UvCmd; Install-Dependencies }
+function Stage-NodeDeps         { Install-NodeDeps }
 function Stage-Desktop          { Install-DesktopVoiceDeps; Install-Desktop }
 function Stage-Path             { Set-PathVariable }
 function Stage-ConfigTemplates  { Copy-ConfigTemplates }
@@ -4085,44 +4085,7 @@ function Invoke-PayloadStageRepository {
     return $true
 }
 
-function Invoke-PayloadStageWheels {
-    if (-not (Test-PayloadHas "wheels")) { return $false }
-    $wheels = Join-Path $PayloadDir "wheels"
-    $requirements = Join-Path $wheels "requirements-payload.txt"
-    if (-not (Test-Path $requirements)) { return $false }
-    Write-Info "Installing Python dependencies from bundled wheelhouse..."
-    # Deliberately NOT `uv sync`: with --offline --no-index, sync resolves
-    # lock entries against their recorded registry URLs and never consults
-    # --find-links. `uv pip install` honors it. The wheelhouse carries the
-    # requirements export it was filled from plus the build-system wheels
-    # the editable hermes-agent install needs.
-    Push-Location $InstallDir
-    $env:VIRTUAL_ENV = Join-Path $InstallDir "venv"
-    try {
-        & $script:UvCmd pip install --offline --no-index --find-links $wheels -r $requirements
-        if ($LASTEXITCODE -ne 0) { return $false }
-        & $script:UvCmd pip install --offline --no-index --find-links $wheels --no-deps -e .
-        if ($LASTEXITCODE -ne 0) { return $false }
-    } finally {
-        Remove-Item Env:VIRTUAL_ENV -ErrorAction SilentlyContinue
-        Pop-Location
-    }
-    Write-Success "Python dependencies installed offline"
-    return $true
-}
 
-function Invoke-PayloadStageJs {
-    if (-not (Test-PayloadHas "js-prebuilt")) { return $false }
-    $archive = Join-Path $PayloadDir "js-prebuilt.tar.gz"
-    if (-not (Test-Path $archive)) { return $false }
-    Write-Info "Unpacking prebuilt JS surfaces (no npm needed)..."
-    # gzip on purpose: every platform's tar reads -z (macOS bsdtar has no
-    # zstd), and this runs on the user machine.
-    & tar -xzf $archive -C $InstallDir 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { return $false }
-    Write-Success "Prebuilt JS surfaces unpacked"
-    return $true
-}
 
 function Write-InstallModeManifest {
     # Decides and writes .hermes-install.json at install completion. The

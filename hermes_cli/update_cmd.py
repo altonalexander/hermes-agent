@@ -3763,6 +3763,132 @@ def _normalize_managed_eol(git_cmd, repo_root):
         # Never let line-ending cleanup block an update.
         pass
 
+def _eject_resident_bundle(bundle_repo_root, pinned_tag: str, channel: str) -> int:
+    """Eject a resident bundle: create a real source install.
+
+    The resident bundle is sealed (codesigned resources); no git graft is
+    possible or wanted. Instead this clones the repository at the pinned
+    tag into ``$HERMES_HOME/hermes-agent`` and builds its venv the way a
+    source install does: ``uv venv`` + ``uv sync``. Network is required —
+    the same contract as every other eject.
+
+    Returns a process exit code.
+    """
+    from hermes_cli.install_manifest import (
+        MODE_SOURCE,
+        STYLE_EJECTED,
+        install_manifest_path,
+        write_install_manifest,
+    )
+
+    target = get_hermes_home() / "hermes-agent"
+    if (target / ".git").exists():
+        manifest_there = None
+        try:
+            manifest_there = json.loads((target / ".hermes-install.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        if manifest_there is None or manifest_there.get("installMode") == "source":
+            print(f"✓ A source checkout already exists at {target}.")
+            print("  The desktop app will use it on its next launch.")
+            print("  Update it with: hermes update")
+            return 0
+
+    git_cmd = ["git"]
+    if sys.platform == "win32":
+        git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+
+    print("⚕ Hermes ejects this install from the sealed app bundle...")
+    print(f"→ Hermes clones the repository at {pinned_tag} into {target} (this can take a minute)...")
+
+    # Clone into a scratch dir first so a failed clone never leaves a
+    # half-usable checkout where the desktop's resolution would find it.
+    scratch = target.with_name(target.name + ".eject-tmp")
+    shutil.rmtree(scratch, ignore_errors=True)
+    clone = subprocess.run(
+        git_cmd + ["clone", "--depth", "1", "--branch", pinned_tag,
+                   OFFICIAL_REPO_URL, str(scratch)],
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if clone.returncode != 0:
+        shutil.rmtree(scratch, ignore_errors=True)
+        stderr = (clone.stderr or "").strip()
+        print("✗ git clone failed. Hermes aborted the eject. The install is unchanged.")
+        if stderr:
+            print(f"  {stderr.splitlines()[0]}")
+        return 1
+    # The clone lands on a detached tag; put it on main so `hermes update`
+    # finds its expected branch shape.
+    subprocess.run(
+        git_cmd + ["checkout", "-B", "main"],
+        cwd=scratch,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+
+    print("→ Hermes builds the Python environment (uv sync)...")
+    uv_bin = _resolve_any_uv()
+    if not uv_bin:
+        shutil.rmtree(scratch, ignore_errors=True)
+        print("✗ No uv binary found. Hermes aborted the eject. The install is unchanged.")
+        return 1
+    sync = subprocess.run(
+        [uv_bin, "sync", "--extra", "all", "--locked"],
+        cwd=scratch,
+        env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(scratch / "venv")},
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if sync.returncode != 0:
+        shutil.rmtree(scratch, ignore_errors=True)
+        print("✗ uv sync failed. Hermes aborted the eject. The install is unchanged.")
+        return 1
+
+    if target.exists():
+        # A non-source checkout (phase-1 materialized tree) gets replaced;
+        # its manifest said bundled, so the desktop owned it.
+        backup = target.with_name(target.name + ".pre-eject")
+        shutil.rmtree(backup, ignore_errors=True)
+        target.rename(backup)
+        print(f"  • The previous desktop-managed checkout moved to {backup}")
+    scratch.rename(target)
+
+    write_install_manifest(
+        {
+            "installMode": MODE_SOURCE,
+            "channel": channel,
+            "manageStyle": STYLE_EJECTED,
+            "pinnedTag": pinned_tag,
+        },
+        target,
+    )
+
+    print("✓ Ejected. A source-managed checkout now exists.")
+    print(f"  • Checkout: {target}")
+    print(f"  • Update channel: {channel}"
+          + (" (tagged releases)" if channel == "stable" else " (git main)"))
+    print("  • Update with: hermes update (from the new checkout)")
+    print("  • The desktop app will use the new checkout on its next launch.")
+    print("  • The app itself keeps updating through its own updater.")
+    print(f"  • Manifest: {install_manifest_path(target)}")
+    return 0
+
+
+def _resolve_any_uv():
+    """The managed uv, the bundle's payload uv, or uv on PATH."""
+    from hermes_cli.managed_uv import resolve_uv
+
+    managed = resolve_uv()
+    if managed:
+        return managed
+    # Resident bundles ship uv beside the repo: <payload>/uv/uv. PROJECT_ROOT
+    # is <payload>/repo, so the sibling directory is the payload root.
+    bundle_uv = _m().PROJECT_ROOT.parent / "uv" / ("uv.exe" if sys.platform == "win32" else "uv")
+    if bundle_uv.is_file() and os.access(bundle_uv, os.X_OK):
+        return str(bundle_uv)
+    return shutil.which("uv")
+
+
 def cmd_update_eject(args) -> int:
     """Implement ``hermes update --eject``.
 
@@ -3823,6 +3949,15 @@ def cmd_update_eject(args) -> int:
         print("  Reinstall from source instead:")
         print("  curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash")
         return 1
+
+    # Resident bundle: the running code lives inside the sealed app
+    # (Resources/agent-payload/repo). There is nothing to graft git onto —
+    # the eject CREATES the source install by running the platform
+    # installer against ~/.hermes/hermes-agent. The bundle itself is never
+    # touched; the desktop simply stops preferring it once the new
+    # checkout's manifest says source.
+    if manifest.get("resident") is True:
+        return _eject_resident_bundle(project_root, pinned_tag, channel)
 
     git_cmd = ["git"]
     if sys.platform == "win32":

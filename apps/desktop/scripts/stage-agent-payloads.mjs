@@ -314,6 +314,27 @@ function stageRepo(tag, outDir) {
   run("git", ["archive", "--format=tar", "-o", archive, tag], { cwd: REPO_ROOT })
   run(hostTarBin(), ["-xf", archive, "-C", repoDir])
   fs.rmSync(archive, { force: true })
+  // The PREBUILT JS surfaces live inside the repo tree, exactly where a
+  // source checkout builds them. CI builds ui-tui (with hermes-ink) and
+  // the dashboard SPA BEFORE this script runs; here they are copied in
+  // as plain directories. The SPA's real outDir is hermes_cli/web_dist
+  // (web/vite.config.ts) — the old js-prebuilt list named a root-level
+  // web_dist that never existed, and its existsSync filter silently
+  // dropped it from every artifact. dereference: ui-tui/node_modules
+  // carries the hermes-ink workspace symlink, and symlinks do not
+  // reliably survive the electron-builder resource copy.
+  const jsSurfaces = ["ui-tui/dist", "ui-tui/node_modules", "hermes_cli/web_dist"].filter((p) =>
+    fs.existsSync(path.join(REPO_ROOT, p))
+  )
+  if (jsSurfaces.length < 3) {
+    throw new Error(`repo: prebuilt JS surfaces missing — run the ui-tui/web builds first (found: ${jsSurfaces.join(", ") || "none"})`)
+  }
+  for (const surface of jsSurfaces) {
+    fs.cpSync(path.join(REPO_ROOT, surface), path.join(repoDir, surface), {
+      recursive: true,
+      dereference: true,
+    })
+  }
   // Version provenance without git: the schema-v2 build stamp. The
   // version_info ladder prefers this stamp over git probing, so bundled
   // installs report exact-release provenance (distance 0, the tag's
@@ -327,12 +348,27 @@ function stageRepo(tag, outDir) {
     "--distance", "0",
     "--source", "ci",
   ])
+  // The install manifest is BUILD metadata for a resident bundle: the
+  // payload repo is always desktop-managed, always the stable channel,
+  // always pinned to this tag. Shipping it statically means the Python
+  // side (update refusal, eject, channel vocabulary) reads the same file
+  // in a resident bundle as in a materialized checkout. `resident: true`
+  // is what tells eject that there is no checkout to graft git onto — it
+  // must CREATE one at ~/.hermes/hermes-agent instead.
+  fs.writeFileSync(
+    path.join(repoDir, ".hermes-install.json"),
+    JSON.stringify(
+      { schemaVersion: 1, installMode: "bundled", channel: "stable", manageStyle: "adopted", pinnedTag: tag, resident: true },
+      null,
+      2
+    ) + "\n"
+  )
   return commit
 }
 
 // Windows: name System32's bsdtar by full path. A GNU tar earlier on
 // PATH (Git bash on the GitHub runners) reads "C:" in a path as a
-// remote host name. bsdtar also has the --zstd support js-prebuilt needs.
+// remote host name.
 function hostTarBin() {
   return process.platform === "win32"
     ? path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe")
@@ -439,85 +475,84 @@ function findPythonBinary(pythonDir, target) {
   throw new Error(`python: no ${name} found under ${roots.join(", ")}`)
 }
 
-/**
- * Check a wheelhouse file list against the target. Returns the offending
- * names. A wheel is wrong when its platform tag names another OS or
- * another architecture. Pure-python wheels (`none-any`) are always fine.
- * pip resolves tags for the interpreter that RUNS it, so a wrong-arch
- * python (or an emulated one) fills the wheelhouse with wheels the
- * payload's CPython cannot import — at first launch, offline.
- */
-export function wrongArchWheels(fileNames, target) {
-  const want = {
-    "linux-x64": /manylinux.*x86_64|musllinux.*x86_64|linux_x86_64/,
-    "linux-arm64": /manylinux.*aarch64|musllinux.*aarch64|linux_aarch64/,
-    "darwin-x64": /macosx.*(x86_64|universal2|intel)/,
-    "darwin-arm64": /macosx.*(arm64|universal2)/,
-    "win32-x64": /win_amd64/,
-    "win32-arm64": /win_arm64/,
-  }[target.key]
-
-  return fileNames.filter((name) => {
-    if (!name.endsWith(".whl")) return false
-    const platformTag = name.slice(0, -4).split("-").pop() || ""
-    if (platformTag === "any") return false
-    return !want.test(platformTag)
-  })
-}
-
-function stageWheels(target, outDir, pythonBinary) {
-  const wheelsDir = path.join(outDir, "wheels")
-  fs.rmSync(wheelsDir, { recursive: true, force: true })
-  fs.mkdirSync(wheelsDir, { recursive: true })
-  // Export the lock to a requirements file. Then fetch wheels with pip
-  // running ON THE STAGED PAYLOAD INTERPRETER: pip resolves platform
-  // tags for the interpreter that executes it, so this is what pins the
-  // wheelhouse to the target architecture. (uvx pip runs under uvx's
-  // own python — on the arm64 test box that pulled win_amd64 wheels.)
-  // --only-binary means "download published wheels" and never compile.
+function stageSitePackages(target, outDir, pythonBinary) {
+  const sitePackagesDir = path.join(outDir, "site-packages")
+  fs.rmSync(sitePackagesDir, { recursive: true, force: true })
+  fs.mkdirSync(sitePackagesDir, { recursive: true })
+  // Export the lock to a requirements file, then install the whole tree
+  // with pip running ON THE STAGED PAYLOAD INTERPRETER: pip resolves
+  // platform tags for the interpreter that executes it, so this is what
+  // pins site-packages to the target architecture. (uvx pip runs under
+  // uvx's own python — on the arm64 test box that pulled win_amd64
+  // wheels.) No venv anywhere: a venv's bin/python is a symlink to an
+  // ABSOLUTE build-host path, and the .app runs from unpredictable
+  // locations (renames, Gatekeeper translocation, AppImage mounts).
   if (!pythonBinary) {
-    throw new Error("wheels: the uv/python stage must run first (it provides the payload interpreter)")
+    throw new Error("site-packages: the uv/python stage must run first (it provides the payload interpreter)")
   }
   run("uv", ["export", "--frozen", "--no-emit-project", "-o", "requirements-payload.txt"], { cwd: REPO_ROOT })
-  // `uv pip wheel` does not exist; uvx runs the real pip, and --python
-  // makes uvx build pip's environment on the staged interpreter.
   run(
     "uvx",
-    ["--python", pythonBinary, "pip", ...wheelDownloadArgs({ wheelsDir, sourceBuild: target.sourceBuild || [] })],
-    { cwd: REPO_ROOT }
-  )
-  // The consumer (install.sh --payload-dir) installs from this exact
-  // requirements export, so it ships beside the wheels. `uv sync` cannot
-  // do that install: with --offline --no-index it resolves lock entries
-  // against their recorded registry URLs and never consults --find-links
-  // (verified against uv 0.11 and 0.12 on the macOS test box). The
-  // consumer therefore runs `uv pip install -r` + `-e . --no-deps`.
-  fs.copyFileSync(path.join(REPO_ROOT, "requirements-payload.txt"), path.join(wheelsDir, "requirements-payload.txt"))
-  // The editable install of hermes-agent builds against pyproject.toml's
-  // [build-system] requires — offline, so those wheels must ship too.
-  const buildRequires = (fs.readFileSync(path.join(REPO_ROOT, "pyproject.toml"), "utf8")
-    .match(/^requires\s*=\s*\[([^\]]*)\]/m)?.[1] || "")
-    .split(",")
-    .map((s) => s.trim().replace(/^["']|["']$/g, ""))
-    .filter(Boolean)
-  if (buildRequires.length === 0) {
-    throw new Error("wheels: no [build-system] requires found in pyproject.toml")
-  }
-  run(
-    "uvx",
-    ["--python", pythonBinary, "pip", "download", "--only-binary", ":all:", "-d", wheelsDir, ...buildRequires],
+    ["--python", pythonBinary, "pip", ...pipTargetArgs({ sitePackagesDir, sourceBuild: target.sourceBuild || [] })],
     { cwd: REPO_ROOT }
   )
 
-  const bad = wrongArchWheels(fs.readdirSync(wheelsDir), target)
-  if (bad.length > 0) {
-    throw new Error(
-      `wheels: ${bad.length} wheel(s) carry a platform tag for another ` +
-        `target than ${target.key}:\n  ${bad.join("\n  ")}\n` +
-        `The pip that filled this wheelhouse resolves tags for its OWN ` +
-        `interpreter — build on a native runner.`
-    )
+  // hermes-agent's own code imports from repo/ (the .pth puts it first on
+  // sys.path — PROJECT_ROOT derivations need the real tree around the
+  // packages). But importlib.metadata.version("hermes-agent") needs a
+  // dist-info, so install the project alone into a scratch target and
+  // keep ONLY its dist-info. The RECORD names files that are not in
+  // site-packages; importlib.metadata reads METADATA, not RECORD.
+  const scratch = path.join(outDir, ".dist-info-scratch")
+  fs.rmSync(scratch, { recursive: true, force: true })
+  run(
+    "uvx",
+    ["--python", pythonBinary, "pip", "install", "--target", scratch, "--no-deps", "--no-compile", "."],
+    { cwd: REPO_ROOT }
+  )
+  const distInfo = fs.readdirSync(scratch).find((name) => name.endsWith(".dist-info"))
+  if (!distInfo) {
+    throw new Error("site-packages: pip produced no dist-info for hermes-agent")
   }
+  fs.cpSync(path.join(scratch, distInfo), path.join(sitePackagesDir, distInfo), { recursive: true })
+  fs.rmSync(scratch, { recursive: true, force: true })
+
+  // Architecture backstop: import the heaviest native extensions with
+  // site-packages on the path. On the native CI runner a wrong-arch
+  // tree fails here instead of on the user machine. (The old wheelhouse
+  // filename check has no equivalent — pip already unpacked the wheels —
+  // and actually importing is the stronger proof.)
+  probe(pythonBinary, [
+    "-c",
+    `import sys; sys.path.insert(0, ${JSON.stringify(sitePackagesDir)}); import pydantic_core, cryptography, charset_normalizer`,
+  ])
+}
+
+/**
+ * The relative sys.path entries for the bundle glue. A .pth file's
+ * non-import lines are resolved against the DIRECTORY CONTAINING THE
+ * .PTH FILE, so relative entries make the payload fully relocatable:
+ * no absolute paths exist anywhere in the artifact. repo/ comes first
+ * so its packages win over anything in site-packages.
+ */
+export function bundlePthLines(purelibDir, payloadRoot, pathModule = path) {
+  return ["repo", "site-packages"].map((entry) =>
+    pathModule.relative(purelibDir, pathModule.join(payloadRoot, entry))
+  )
+}
+
+function writeBundlePth(outDir, pythonBinary) {
+  // Ask the interpreter where its own site-packages lives instead of
+  // hardcoding the layout (POSIX: lib/python3.11/site-packages,
+  // Windows: Lib/site-packages).
+  const purelib = probe(pythonBinary, ["-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"]).trim()
+  if (!purelib || !fs.existsSync(purelib)) {
+    throw new Error(`bundle pth: interpreter reports nonexistent purelib: ${purelib}`)
+  }
+  fs.writeFileSync(
+    path.join(purelib, "hermes-bundle.pth"),
+    bundlePthLines(purelib, outDir).join("\n") + "\n"
+  )
 }
 
 function stageNode(target, outDir) {
@@ -545,29 +580,6 @@ function stageNode(target, outDir) {
     throw new Error(`node: staged binary at ${nodeBinary} did not run, so its architecture is unverified`)
   }
   assertBanner("node", reportedArch, bannerExpectations(target).node)
-}
-
-function stageJsPrebuilt(outDir) {
-  // CI builds ui-tui (with hermes-ink) and web_dist BEFORE this script
-  // runs. Here we only tar what exists. The tar excludes apps/desktop on
-  // purpose. The bundled shell IS the desktop app (plan §2.1).
-  const listFile = path.join(outDir, ".js-prebuilt-paths")
-  const candidates = ["ui-tui/dist", "ui-tui/node_modules", "web_dist"].filter((p) =>
-    fs.existsSync(path.join(REPO_ROOT, p))
-  )
-  if (candidates.length === 0) {
-    throw new Error("no prebuilt JS surfaces found — run the ui-tui/web builds first")
-  }
-  fs.writeFileSync(listFile, candidates.join("\n") + "\n")
-  // gzip, not zstd: the consumer is the USER machine's tar at first
-  // launch, and macOS bsdtar has no zstd support (its libarchive is
-  // built without it) — the stage silently degraded to an npm install
-  // that bundled machines cannot run. Every platform's tar reads -z.
-  run(hostTarBin(), [
-    "-czf", path.join(outDir, "js-prebuilt.tar.gz"),
-    "-C", REPO_ROOT, "-T", listFile,
-  ])
-  fs.rmSync(listFile, { force: true })
 }
 
 function main() {
@@ -608,9 +620,15 @@ function main() {
       payloadPython = stageUvAndPython(target, OUT_DIR)
     },
     python: () => {}, // The uv step stages python too (one uv invocation).
-    wheels: () => stageWheels(target, OUT_DIR, payloadPython),
+    "site-packages": () => {
+      stageSitePackages(target, OUT_DIR, payloadPython)
+      // The glue that makes the payload interpreter resolve repo/ and
+      // site-packages/ wherever the bundle sits. Written after both
+      // stages exist so a failed staging run never leaves a .pth that
+      // points at nothing.
+      writeBundlePth(OUT_DIR, payloadPython)
+    },
     node: () => stageNode(target, OUT_DIR),
-    "js-prebuilt": () => stageJsPrebuilt(OUT_DIR),
   }
 
   for (const item of PAYLOAD_ITEMS) {

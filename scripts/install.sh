@@ -188,7 +188,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --hermes-home PATH  Data directory (default: ~/.hermes, or \$HERMES_HOME)"
             echo "  --payload-dir PATH  Offline payload tree (desktop bundled artifact)."
             echo "                   Install stages read local content from the payload:"
-            echo "                   repo snapshot, uv, python, wheels, node, prebuilt JS."
+            echo "                   repo snapshot (with prebuilt JS), uv, python, node."
             echo "                   If an item is missing, the stage uses the network."
             echo "  -h, --help     Show this help"
             echo ""
@@ -423,8 +423,8 @@ payload_stage_repo() {
     mkdir -p "$(dirname "$INSTALL_DIR")"
     if [ -d "$INSTALL_DIR" ]; then
         # Replace an existing bundled or adopted-legacy checkout with the
-        # payload tree, but keep the expensive runtime dirs (the wheels and
-        # js stages refresh their content in place) and user secrets. The
+        # payload tree, but keep the expensive runtime dirs (the venv and
+        # node_modules refresh in place) and user secrets. The
         # old .git of an adopted legacy checkout is dropped on purpose:
         # a bundled checkout is gitless by design.
         local keep entry
@@ -441,42 +441,6 @@ payload_stage_repo() {
         cp -R "$PAYLOAD_DIR/repo" "$INSTALL_DIR" || return 1
     fi
     log_success "Checkout materialized offline at $(payload_tag)"
-}
-
-# payload_stage_wheels: installs the Python dependencies offline from the
-# wheelhouse. This deliberately does NOT use `uv sync`: with --offline
-# --no-index, sync resolves lock entries against their recorded registry
-# URLs and never consults --find-links, so every install fails as a cache
-# miss. `uv pip install` honors --find-links. The wheelhouse carries the
-# exact requirements export it was filled from, plus the build-system
-# wheels the editable hermes-agent install needs. Returns 1 to signal
-# "fall back to network uv sync".
-payload_stage_wheels() {
-    payload_has wheels || return 1
-    [ -f "$PAYLOAD_DIR/wheels/requirements-payload.txt" ] || return 1
-    log_info "Installing Python dependencies from bundled wheelhouse..."
-    (
-        cd "$INSTALL_DIR"
-        export VIRTUAL_ENV="$INSTALL_DIR/venv"
-        $UV_CMD pip install --offline --no-index \
-            --find-links "$PAYLOAD_DIR/wheels" \
-            -r "$PAYLOAD_DIR/wheels/requirements-payload.txt" \
-            && $UV_CMD pip install --offline --no-index \
-                --find-links "$PAYLOAD_DIR/wheels" \
-                --no-deps -e .
-    ) || return 1
-    log_success "Python dependencies installed offline"
-}
-
-# payload_stage_js: unpacks the prebuilt JS surfaces (ui-tui dist plus
-# node_modules, and web_dist) from a tar.gz archive. gzip on purpose:
-# macOS bsdtar reads no zstd, and this runs on the user machine.
-payload_stage_js() {
-    payload_has js-prebuilt || return 1
-    [ -f "$PAYLOAD_DIR/js-prebuilt.tar.gz" ] || return 1
-    log_info "Unpacking prebuilt JS surfaces (no npm needed)..."
-    tar -xzf "$PAYLOAD_DIR/js-prebuilt.tar.gz" -C "$INSTALL_DIR" || return 1
-    log_success "Prebuilt JS surfaces unpacked"
 }
 
 # payload_stage_runtimes: seeds the Hermes-managed uv ($HERMES_HOME/bin/uv)
@@ -3432,7 +3396,7 @@ run_stage_body() {
             payload_stage_runtimes
             install_uv
             check_python
-            payload_stage_wheels || install_deps
+            install_deps
             ;;
         node-deps)
             detect_os
@@ -3440,7 +3404,7 @@ run_stage_body() {
             require_install_dir
             payload_stage_runtimes
             check_node
-            payload_stage_js || install_node_deps
+            install_node_deps
             ;;
         path)
             detect_os
@@ -3556,8 +3520,8 @@ main() {
 
     payload_stage_repo || clone_repo
     setup_venv
-    payload_stage_wheels || install_deps
-    payload_stage_js || install_node_deps
+    install_deps
+    install_node_deps
     setup_path
     copy_config_templates
     run_setup_wizard

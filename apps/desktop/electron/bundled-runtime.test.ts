@@ -6,12 +6,15 @@ import {
   type AdoptionFacts,
   adoptionManifest,
   decideAdoption,
+  decideResidentRuntime,
   executeAdoptionCheckout,
+  findResidentPython,
   gatherGitFacts,
   type GitRunner,
   latestReleaseFromLsRemote,
   needsRematerialization,
   payloadArgs,
+  type PayloadInfo,
   resolveChannel,
   resolvePayload
 } from '../electron/bundled-runtime'
@@ -50,10 +53,170 @@ test('resolvePayload returns dir + tag for a real payload', () => {
 })
 
 test('payloadArgs maps installer kind, empty for null payload', () => {
-  const p = { dir: '/res/agent-payload', tag: 'v1.0.0', items: {} }
+  const p = { dir: '/res/agent-payload', tag: 'v1.0.0', schemaVersion: 2, items: {} }
   assert.deepEqual(payloadArgs('posix', p), ['--payload-dir', '/res/agent-payload'])
   assert.deepEqual(payloadArgs('powershell', p), ['-PayloadDir', '/res/agent-payload'])
   assert.deepEqual(payloadArgs('posix', null), [])
+})
+
+// ─── decideResidentRuntime ─────────────────────────────────────────
+
+const residentPayload = (overrides: Partial<PayloadInfo> = {}): PayloadInfo => ({
+  dir: '/res/agent-payload',
+  tag: 'v2.0.0',
+  schemaVersion: 2,
+  items: {
+    repo: { status: 'staged' },
+    uv: { status: 'staged' },
+    python: { status: 'staged' },
+    'site-packages': { status: 'staged' },
+    node: { status: 'staged' }
+  },
+  ...overrides
+})
+
+test('a complete schema-2 payload runs resident on a fresh machine', () => {
+  const d = decideResidentRuntime({
+    payload: residentPayload(),
+    checkoutExists: false,
+    checkoutManifest: null,
+    markerSaysDesktop: false
+  })
+
+  assert.equal(d.resident, true)
+})
+
+test('resident even over an old desktop-managed checkout (marker or bundled manifest)', () => {
+  // Phase-1 materialized checkout: manifest says bundled.
+  assert.equal(
+    decideResidentRuntime({
+      payload: residentPayload(),
+      checkoutExists: true,
+      checkoutManifest: { installMode: 'bundled' },
+      markerSaysDesktop: true
+    }).resident,
+    true
+  )
+  // Pre-manifest desktop install: no manifest, but the desktop marker
+  // proves provenance.
+  assert.equal(
+    decideResidentRuntime({
+      payload: residentPayload(),
+      checkoutExists: true,
+      checkoutManifest: null,
+      markerSaysDesktop: true
+    }).resident,
+    true
+  )
+})
+
+test('never resident over a checkout the user owns', () => {
+  // Ejected / deliberate source install.
+  const ejected = decideResidentRuntime({
+    payload: residentPayload(),
+    checkoutExists: true,
+    checkoutManifest: { installMode: 'source' },
+    markerSaysDesktop: true
+  })
+
+  assert.equal(ejected.resident, false)
+  assert.match(ejected.reason, /source-managed/)
+
+  // CLI-first user: checkout exists, no manifest, no desktop marker.
+  const cliFirst = decideResidentRuntime({
+    payload: residentPayload(),
+    checkoutExists: true,
+    checkoutManifest: null,
+    markerSaysDesktop: false
+  })
+
+  assert.equal(cliFirst.resident, false)
+  assert.match(cliFirst.reason, /CLI-first/)
+})
+
+test('thin, pre-resident, and incomplete payloads never run resident', () => {
+  assert.match(
+    decideResidentRuntime({
+      payload: null,
+      checkoutExists: false,
+      checkoutManifest: null,
+      markerSaysDesktop: false
+    }).reason,
+    /thin/
+  )
+  // Phase-1 artifact: schemaVersion 1.
+  assert.match(
+    decideResidentRuntime({
+      payload: residentPayload({ schemaVersion: 1 }),
+      checkoutExists: false,
+      checkoutManifest: null,
+      markerSaysDesktop: false
+    }).reason,
+    /predates/
+  )
+  // uv is mandatory: runtime lazy installs for plugins depend on it.
+  const noUv = residentPayload()
+  noUv.items = { ...noUv.items, uv: { status: 'skipped' } }
+
+  const d = decideResidentRuntime({
+    payload: noUv,
+    checkoutExists: false,
+    checkoutManifest: null,
+    markerSaysDesktop: false
+  })
+
+  assert.equal(d.resident, false)
+  assert.match(d.reason, /missing: uv/)
+})
+
+// ─── findResidentPython ────────────────────────────────────────────
+
+test('findResidentPython picks the patch-versioned dir and needs a real binary', () => {
+  const fsStub = (dirs: string[], files: string[]) => ({
+    readdirSync: (p: string) => {
+      if (!p.endsWith('python')) {throw new Error('ENOENT')}
+
+      return dirs
+    },
+    existsSync: (p: string) => files.some(f => p === f)
+  })
+
+  // Patch-versioned real dir wins over the minor alias (reverse sort).
+  const python = findResidentPython(
+    '/res/agent-payload',
+    'darwin',
+    fsStub(
+      ['cpython-3.11-macos-aarch64-none', 'cpython-3.11.15-macos-aarch64-none'],
+      ['/res/agent-payload/python/cpython-3.11.15-macos-aarch64-none/bin/python3']
+    ) as never
+  )
+
+  assert.match(String(python), /3\.11\.15.*bin\/python3$/)
+
+  // No python dir at all → null, not a throw.
+  assert.equal(
+    findResidentPython('/res/agent-payload', 'darwin', {
+      readdirSync: () => {
+        throw new Error('ENOENT')
+      },
+      existsSync: () => false
+    } as never),
+    null
+  )
+
+  // Windows binary lives at the install root, not bin/. The
+  // implementation joins with the HOST path module, so the test builds
+  // its expected path the same way to stay host-agnostic.
+  const winRoot = 'win-res/agent-payload'
+  const winExpected = ['win-res/agent-payload', 'python', 'cpython-3.11.15-windows-x86_64-none', 'python.exe'].join('/')
+
+  const winPython = findResidentPython(
+    winRoot,
+    'win32',
+    fsStub(['cpython-3.11.15-windows-x86_64-none'], [winExpected]) as never
+  )
+
+  assert.match(String(winPython), /python\.exe$/)
 })
 
 // ─── needsRematerialization ────────────────────────────────────────

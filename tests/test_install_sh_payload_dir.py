@@ -86,17 +86,17 @@ def _git(cwd, *args):
 
 class TestPayloadHas:
     def test_staged_item_detected(self, tmp_path):
-        payload = make_payload(tmp_path, items=("repo", "wheels"))
-        r = run_payload_snippet("payload_has wheels && echo YES", payload_dir=payload)
+        payload = make_payload(tmp_path, items=("repo", "site-packages"))
+        r = run_payload_snippet("payload_has site-packages && echo YES", payload_dir=payload)
         assert "YES" in r.stdout
 
     def test_missing_item_and_skipped_status_rejected(self, tmp_path):
         payload = make_payload(tmp_path, items=("repo",))
         manifest = json.loads((payload / "manifest.json").read_text())
-        manifest["items"]["wheels"] = {"status": "skipped", "reason": "explicit-skip"}
+        manifest["items"]["site-packages"] = {"status": "skipped", "reason": "explicit-skip"}
         (payload / "manifest.json").write_text(json.dumps(manifest))
         r = run_payload_snippet(
-            "payload_has wheels && echo YES || echo NO", payload_dir=payload
+            "payload_has site-packages && echo YES || echo NO", payload_dir=payload
         )
         assert "NO" in r.stdout
 
@@ -185,7 +185,7 @@ class TestPayloadStageRepo:
         assert not (install_dir / "f0.txt").exists()
 
     def test_no_repo_item_falls_back(self, tmp_path):
-        payload = make_payload(tmp_path, items=("wheels",))
+        payload = make_payload(tmp_path, items=("site-packages",))
         r = run_payload_snippet(
             "payload_stage_repo && echo STAGED || echo FALLBACK",
             payload_dir=payload, install_dir=tmp_path / "x",

@@ -18,6 +18,7 @@ import path from 'node:path'
 export interface PayloadInfo {
   dir: string
   tag: string | null
+  schemaVersion: number | null
   items: Record<string, { status: string }>
 }
 
@@ -57,7 +58,12 @@ export function resolvePayload(
     return null
   }
 
-  return { dir, tag: typeof parsed.tag === 'string' ? parsed.tag : null, items }
+  return {
+    dir,
+    tag: typeof parsed.tag === 'string' ? parsed.tag : null,
+    schemaVersion: typeof parsed.schemaVersion === 'number' ? parsed.schemaVersion : null,
+    items
+  }
 }
 
 /** Build the extra installer arguments for a payload-backed bootstrap. */
@@ -67,6 +73,106 @@ export function payloadArgs(installerKind: 'posix' | 'powershell', payload: Payl
   }
 
   return installerKind === 'posix' ? ['--payload-dir', payload.dir] : ['-PayloadDir', payload.dir]
+}
+
+// ─── resident runtime (plan: 2026-08-07_resources-resident-bundled-runtime) ──
+
+// The payload items a resident launch requires — all of them. uv never
+// installs the runtime (site-packages ships prebuilt), but runtime lazy
+// installs for plugins are a mandatory feature, and uv is what installs
+// them into the writable overlay. A payload without uv is an incomplete
+// artifact, not a degraded one.
+export const RESIDENT_RUNTIME_ITEMS = ['repo', 'uv', 'python', 'site-packages', 'node'] as const
+
+export interface ResidentDecision {
+  resident: boolean
+  reason: string
+}
+
+/**
+ * Decide whether this launch runs the backend directly out of the payload
+ * in resources (resident) instead of a checkout at ~/.hermes/hermes-agent.
+ *
+ * Resident is the default for a complete schema-2 payload. The checkout
+ * wins only when the user demonstrably owns it:
+ * - its manifest says installMode:source (an eject, or a deliberate
+ *   install.sh run — both write that manifest), or
+ * - it exists with NO manifest and NO desktop-written bootstrap marker,
+ *   which is the pre-manifest curl|bash cohort. CLI-first users keep
+ *   their install; the desktop never silently shadows it.
+ *
+ * A pre-manifest checkout WITH a desktop marker (old desktop installs)
+ * and a phase-1 bundled checkout (manifest installMode:bundled) both go
+ * resident: their materialized trees were desktop-managed anyway, and
+ * nothing is deleted — the preference is reversible by eject.
+ */
+export function decideResidentRuntime(facts: {
+  payload: PayloadInfo | null
+  checkoutExists: boolean
+  checkoutManifest: { installMode?: string } | null
+  markerSaysDesktop: boolean
+}): ResidentDecision {
+  const { payload, checkoutExists, checkoutManifest, markerSaysDesktop } = facts
+
+  if (!payload) {
+    return { resident: false, reason: 'thin build (no payload)' }
+  }
+
+  if ((payload.schemaVersion ?? 0) < 2) {
+    return { resident: false, reason: 'payload predates the resident layout' }
+  }
+
+  const missing = RESIDENT_RUNTIME_ITEMS.filter((item) => payload.items[item]?.status !== 'staged')
+
+  if (missing.length > 0) {
+    return { resident: false, reason: `payload incomplete (missing: ${missing.join(', ')})` }
+  }
+
+  if (checkoutManifest && checkoutManifest.installMode === 'source') {
+    return { resident: false, reason: 'checkout at the active root is source-managed' }
+  }
+
+  if (checkoutExists && !checkoutManifest && !markerSaysDesktop) {
+    return { resident: false, reason: 'legacy checkout without desktop provenance (CLI-first user)' }
+  }
+
+  return { resident: true, reason: 'complete resident payload' }
+}
+
+/**
+ * Locate the payload CPython binary. The install directory is
+ * patch-versioned (python/cpython-3.11.15-<triple>/...), so this scans
+ * rather than hardcoding, and it verifies the binary exists.
+ */
+export function findResidentPython(
+  payloadDir: string,
+  platform: NodeJS.Platform = process.platform,
+  fsImpl: Pick<typeof fs, 'readdirSync' | 'existsSync'> = fs
+): string | null {
+  const pythonRoot = path.join(payloadDir, 'python')
+
+  let entries: string[]
+
+  try {
+    entries = fsImpl.readdirSync(pythonRoot)
+  } catch {
+    return null
+  }
+
+  // Prefer the patch-versioned real directory over the minor alias so the
+  // resolved path is stable across launches (the alias is a symlink).
+  for (const entry of entries.filter((name) => name.startsWith('cpython-')).sort().reverse()) {
+    const candidate =
+      platform === 'win32'
+        ? path.join(pythonRoot, entry, 'python.exe')
+        : path.join(pythonRoot, entry, 'bin', 'python3')
+
+    if (fsImpl.existsSync(candidate)) {
+      return candidate
+    }
+  }
+
+  return null
 }
 
 // ─── marker-tag invalidation ────────────────────────────────────────────────

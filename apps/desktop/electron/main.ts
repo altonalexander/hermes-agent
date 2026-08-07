@@ -50,7 +50,7 @@ import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from '
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
-import { latestReleaseFromLsRemote, needsRematerialization, resolveChannel, resolvePayload } from './bundled-runtime'
+import { decideResidentRuntime, findResidentPython, latestReleaseFromLsRemote, needsRematerialization, resolveChannel, resolvePayload } from './bundled-runtime'
 import {
   adoptionManifest,
   decideAdoption,
@@ -3746,13 +3746,38 @@ function readBootstrapMarker() {
 const INSTALL_MANIFEST_PATH = path.join(ACTIVE_HERMES_ROOT, '.hermes-install.json')
 
 /**
+ * The resident-runtime decision for this launch: run the backend directly
+ * out of the payload in resources, with no materialized checkout. Facts
+ * are re-read on every call (cheap file reads) so an eject flips the
+ * answer without an app restart.
+ */
+function residentRuntimeDecision() {
+  const marker = readBootstrapMarker() as any
+
+  return decideResidentRuntime({
+    payload: resolvePayload(process.resourcesPath),
+    checkoutExists: directoryExists(ACTIVE_HERMES_ROOT),
+    checkoutManifest: readJson(INSTALL_MANIFEST_PATH) as any,
+    // desktopVersion has been written by every desktop bootstrap since the
+    // marker existed; its presence is desktop provenance for the checkout.
+    markerSaysDesktop: Boolean(marker && typeof marker.desktopVersion === 'string')
+  })
+}
+
+/**
  * True when app updates go through electron-updater instead of git.
  * Reads the manifest on every call. An eject flips the manifest to source
  * mode, and the next check must honor that without an app restart.
+ *
+ * A resident launch is bundled BY CONSTRUCTION: the code came from the
+ * app's own resources, so the checkout manifest (which may not even
+ * exist) has no say.
  */
 function bundledUpdaterActive(): boolean {
   const stamp = INSTALL_STAMP as any
-  const manifest = readJson(INSTALL_MANIFEST_PATH) as any
+  const manifest = residentRuntimeDecision().resident
+    ? { installMode: 'bundled' }
+    : (readJson(INSTALL_MANIFEST_PATH) as any)
 
   return shouldUseAppUpdater({
     stampHasPayload: Boolean(stamp && stamp.payload),
@@ -4110,20 +4135,108 @@ function createActiveBackend(backendArgs) {
   }
 }
 
+// createResidentBackend — run the backend directly out of the payload in
+// the app's resources. Nothing is materialized: the payload CPython's
+// hermes-bundle.pth resolves repo/ and site-packages/ relative to itself,
+// so the spawn needs NO PYTHONPATH and survives renames, Gatekeeper
+// translocation, and read-only mounts. All writable state goes under
+// HERMES_HOME (the Docker /opt/hermes vs /opt/data split):
+// - PYTHONPYCACHEPREFIX: the sealed bundle must never see __pycache__
+//   writes (codesign would break; the mount may be read-only anyway).
+// - HERMES_LAZY_INSTALL_TARGET: plugin/lazy deps install into a writable
+//   overlay via the existing uv-pip --target machinery in lazy_deps.
+function createResidentBackend(backendArgs) {
+  const payload = resolvePayload(process.resourcesPath)
+
+  if (!payload) {
+    return null
+  }
+
+  const command = findResidentPython(payload.dir)
+
+  if (!command) {
+    rememberLog(`[resident] payload at ${payload.dir} has no runnable CPython; falling back to checkout resolution`)
+
+    return null
+  }
+
+  const repoRoot = path.join(payload.dir, 'repo')
+  const env = {
+    ...buildDesktopBackendEnv({
+      hermesHome: HERMES_HOME,
+      pythonPathEntries: [],
+      venvRoot: null
+    }),
+    PYTHONPYCACHEPREFIX: path.join(HERMES_HOME, 'pycache'),
+    HERMES_LAZY_INSTALL_TARGET: path.join(HERMES_HOME, 'lazy-packages')
+  }
+
+  // The .pth glue owns import resolution; an inherited PYTHONPATH from the
+  // parent env could shadow bundled modules with foreign ones.
+  if (!env.PYTHONPATH) {
+    delete env.PYTHONPATH
+  }
+
+  // The payload's own node and uv lead PATH so the backend's subprocesses
+  // (TUI builds never happen, but browser tools and lazy installs do)
+  // find the bundled runtimes before any system ones.
+  const pathKey = Object.keys(env).find(key => key.toUpperCase() === 'PATH') || 'PATH'
+
+  env[pathKey] = [path.join(payload.dir, 'node', 'bin'), path.join(payload.dir, 'node'), path.join(payload.dir, 'uv'), env[pathKey]]
+    .filter(Boolean)
+    .join(path.delimiter)
+
+  return {
+    kind: 'python',
+    label: `Hermes resident bundle (${payload.tag || 'untagged'})`,
+    command,
+    args: ['-m', 'hermes_cli.main', ...backendArgs],
+    env,
+    root: repoRoot,
+    resident: true,
+    bootstrap: false,
+    shell: false
+  }
+}
+
 function resolveHermesBackend(backendArgs) {
-  // 0. Bundled builds: decide if a pristine legacy checkout adopts silently
-  //    into the bundled path (plan §1.4). This must run before the code
-  //    below reads the marker or the install manifest, because adoption
-  //    rewrites both. It is a no-op on thin builds and on every
-  //    non-pristine checkout. A successful adoption leaves the pinnedTag of
-  //    the marker stale on purpose. Then the re-materialization branch
-  //    below re-runs the bootstrap, which is now offline.
+  // 0. Resident bundle — the payload in resources IS the runtime. When the
+  //    decision says resident, nothing is materialized, no bootstrap runs,
+  //    and the checkout (if any) is simply not preferred: reversible, and
+  //    an eject flips the decision on the next resolution. This must come
+  //    before adoption: adoption exists to migrate legacy checkouts into
+  //    the MATERIALIZED bundled path, which a resident launch has no use
+  //    for. The HERMES_DESKTOP_HERMES_ROOT escape hatch still wins — it
+  //    exists precisely to point a packaged app at a developer checkout.
+  const overrideRoot = process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT)
+  const resident = overrideRoot ? { resident: false, reason: 'HERMES_DESKTOP_HERMES_ROOT override' } : residentRuntimeDecision()
+
+  if (resident.resident) {
+    const backend = createResidentBackend(backendArgs)
+
+    if (backend) {
+      rememberLog(`[resident] running from the app bundle: ${resident.reason}`)
+
+      return backend
+    }
+    // A complete manifest but an unusable payload (no CPython found) is a
+    // broken artifact; fall through to the checkout/bootstrap chain.
+  } else {
+    rememberLog(`[resident] not resident: ${resident.reason}`)
+  }
+
+  // 1. Bundled builds (materialized mode): decide if a pristine legacy
+  //    checkout adopts silently into the bundled path (plan §1.4). This
+  //    must run before the code below reads the marker or the install
+  //    manifest, because adoption rewrites both. It is a no-op on thin
+  //    builds and on every non-pristine checkout. A successful adoption
+  //    leaves the pinnedTag of the marker stale on purpose. Then the
+  //    re-materialization branch below re-runs the bootstrap, which is
+  //    now offline.
   maybeAutoAdopt()
 
-  // 1. Explicit override -- HERMES_DESKTOP_HERMES_ROOT points at a developer
+  // 2. Explicit override -- HERMES_DESKTOP_HERMES_ROOT points at a developer
   //    checkout. Honour it as-is (no bootstrap; the user is driving).
-  const overrideRoot = process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT)
-
   if (overrideRoot && isHermesSourceRoot(overrideRoot)) {
     const backend = createPythonBackend(overrideRoot, `Hermes source at ${overrideRoot}`, backendArgs)
 

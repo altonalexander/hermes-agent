@@ -1,18 +1,19 @@
 import assert from 'node:assert/strict'
+import path from 'node:path'
 import { test } from 'vitest'
 
 import {
   assertBanner,
   bannerExpectations,
   buildManifest,
+  bundlePthLines,
   parseSkips,
   PAYLOAD_ITEMS,
+  pipTargetArgs,
   pythonDirPattern,
   pythonRequest,
   resolveTag,
-  resolveTargets,
-  wheelDownloadArgs,
-  wrongArchWheels
+  resolveTargets
 } from '../scripts/stage-agent-payloads.mjs'
 
 // ─── resolveTargets ────────────────────────────────────────────────
@@ -45,19 +46,42 @@ test('windows targets map to msvc toolchains, darwin to apple, linux to gnu', ()
   assert.match(resolveTargets('linux', 'x64').pythonPlatform, /linux-gnu$/)
 })
 
-// ─── wheelDownloadArgs ─────────────────────────────────────────────
+// ─── pipTargetArgs ─────────────────────────────────────────────────
 
-test('wheel fetch refuses sdists and targets the wheelhouse dir', () => {
-  const args = wheelDownloadArgs({ wheelsDir: '/out/wheels' })
+test('site-packages install refuses sdists and targets the payload dir', () => {
+  const args = pipTargetArgs({ sitePackagesDir: '/out/site-packages' })
   // Invariants: the requirements come from the frozen lockfile, and the
-  // fetch is binary-only. An sdist in the payload tries to compile at
-  // first launch, which is offline and has no toolchain. The fetch is
+  // install is binary-only. An sdist would try to compile on the build
+  // runner for packages we did not explicitly allow-list. The install is
   // native, so no --platform cross-tags belong here.
-  assert.equal(args[0], 'wheel')
+  assert.equal(args[0], 'install')
   assert.ok(args.includes('--only-binary'))
   assert.equal(args[args.indexOf('-r') + 1], 'requirements-payload.txt')
-  assert.equal(args[args.indexOf('-w') + 1], '/out/wheels')
+  assert.equal(args[args.indexOf('--target') + 1], '/out/site-packages')
   assert.ok(!args.includes('--platform'))
+})
+
+// ─── bundlePthLines ────────────────────────────────────────────────
+
+test('bundle .pth entries are relative and name repo before site-packages', () => {
+  // POSIX layout: purelib nests three levels under the payload root, so
+  // the entries climb out with ../ segments — never absolute paths.
+  const payload = '/build/agent-payload'
+  const purelib = '/build/agent-payload/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/site-packages'
+  const lines = bundlePthLines(purelib, payload, path.posix)
+  assert.equal(lines.length, 2)
+  assert.ok(lines.every((line) => !path.posix.isAbsolute(line)), lines.join(','))
+  assert.match(lines[0], /repo$/)
+  assert.match(lines[1], /site-packages$/)
+
+  // Windows layout (Lib/site-packages) stays relative too.
+  const winLines = bundlePthLines(
+    'C:\\b\\agent-payload\\python\\cpython-3.11.15-windows-x86_64-none\\Lib\\site-packages',
+    'C:\\b\\agent-payload',
+    path.win32
+  )
+  assert.ok(winLines.every((line) => !path.win32.isAbsolute(line)), winLines.join(','))
+  assert.match(winLines[0], /repo$/)
 })
 
 // ─── resolveTag ────────────────────────────────────────────────────
@@ -77,9 +101,11 @@ test('falls back to git describe only for exact release tags', () => {
 // ─── parseSkips ────────────────────────────────────────────────────
 
 test('parseSkips accepts known items and rejects unknown ones', () => {
-  assert.deepEqual([...parseSkips(['--skip=wheels,node'])].sort(), ['node', 'wheels'])
+  assert.deepEqual([...parseSkips(['--skip=site-packages,node'])].sort(), ['node', 'site-packages'])
   assert.equal(parseSkips([]).size, 0)
   assert.throws(() => parseSkips(['--skip=venv']), /unknown --skip/)
+  // Retired payload items must not silently no-op in CI caching configs.
+  assert.throws(() => parseSkips(['--skip=wheels']), /unknown --skip/)
 })
 
 // ─── buildManifest ─────────────────────────────────────────────────
@@ -91,17 +117,17 @@ test('manifest records staged vs explicitly-skipped vs failed per item', () => {
     commit: 'a'.repeat(40),
     target,
     staged: ['repo', 'uv', 'python'],
-    skipped: new Set(['wheels'])
+    skipped: new Set(['site-packages'])
   })
   assert.equal(manifest.tag, 'v1.0.0')
-  // Invariant: every payload item has an entry. The per-stage fallback
-  // logic of the bootstrap reads presence. An absent entry is ambiguous.
+  // Invariant: every payload item has an entry. The resident-runtime gate
+  // reads presence. An absent entry is ambiguous.
   for (const item of PAYLOAD_ITEMS) {
     assert.ok(manifest.items[item], item)
   }
   assert.equal(manifest.items.repo.status, 'staged')
-  assert.equal(manifest.items.wheels.status, 'skipped')
-  assert.equal(manifest.items.wheels.reason, 'explicit-skip')
+  assert.equal(manifest.items['site-packages'].status, 'skipped')
+  assert.equal(manifest.items['site-packages'].reason, 'explicit-skip')
   // node was not staged and not explicitly skipped, so its status is failed.
   assert.equal(manifest.items.node.reason, 'failed')
 })
@@ -121,24 +147,6 @@ test('assertBanner passes on a matching triple and throws on a foreign one', () 
     () => assertBanner('uv', 'uv 0.12.1 (329541a50 x86_64-pc-windows-msvc)', expect.uv),
     /wrong-architecture/
   )
-})
-
-test('wheel arch check flags foreign tags and accepts pure + native wheels', () => {
-  const win64 = resolveTargets('win32', 'x64')
-  const names = [
-    'charset_normalizer-3.4.0-cp311-cp311-win_amd64.whl',
-    'requests-2.32.3-py3-none-any.whl',
-    'pydantic_core-2.27.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl',
-    'requirements-payload.txt'
-  ]
-
-  assert.deepEqual(wrongArchWheels(names, win64), [
-    'pydantic_core-2.27.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl'
-  ])
-
-  // macOS universal2 satisfies both mac targets.
-  const macArm = resolveTargets('darwin', 'arm64')
-  assert.deepEqual(wrongArchWheels(['x-1.0-cp311-cp311-macosx_11_0_universal2.whl'], macArm), [])
 })
 
 test('banner expectations name the target, not the build host', () => {
@@ -173,15 +181,16 @@ test('python dir matcher accepts patch-versioned installs and rejects foreign bu
 test('source-build exceptions override only-binary for the named packages only', () => {
   // Fully wheel-covered targets keep the pure only-binary shape.
   const linux = resolveTargets('linux', 'x64')
-  assert.deepEqual(wheelDownloadArgs({ wheelsDir: '/w', sourceBuild: linux.sourceBuild ?? [] }), [
-    'wheel', '--only-binary', ':all:', '-r', 'requirements-payload.txt', '-w', '/w'
+  assert.deepEqual(pipTargetArgs({ sitePackagesDir: '/sp', sourceBuild: linux.sourceBuild ?? [] }), [
+    'install', '--only-binary', ':all:', '-r', 'requirements-payload.txt',
+    '--target', '/sp', '--upgrade', '--no-compile'
   ])
 
   // win32-arm64 names the packages with no published win_arm64 wheel;
   // pip's later --no-binary overrides --only-binary per package, so
   // exactly these build from sdist and everything else stays wheels-only.
   const winArm = resolveTargets('win32', 'arm64')
-  const args = wheelDownloadArgs({ wheelsDir: '/w', sourceBuild: winArm.sourceBuild })
+  const args = pipTargetArgs({ sitePackagesDir: '/sp', sourceBuild: winArm.sourceBuild })
   const noBinary = args[args.indexOf('--no-binary') + 1]
   assert.ok(args.indexOf('--no-binary') > args.indexOf('--only-binary'))
   assert.equal(noBinary, 'cryptography,httptools,ruamel-yaml-clib,pywinpty,pyyaml')
