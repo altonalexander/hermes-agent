@@ -500,22 +500,23 @@ function stageSitePackages(target, outDir, pythonBinary) {
   // hermes-agent's own code imports from repo/ (the .pth puts it first on
   // sys.path — PROJECT_ROOT derivations need the real tree around the
   // packages). But importlib.metadata.version("hermes-agent") needs a
-  // dist-info, so install the project alone into a scratch target and
-  // keep ONLY its dist-info. The RECORD names files that are not in
-  // site-packages; importlib.metadata reads METADATA, not RECORD.
-  const scratch = path.join(outDir, ".dist-info-scratch")
-  fs.rmSync(scratch, { recursive: true, force: true })
-  run(
-    "uvx",
-    ["--python", pythonBinary, "pip", "install", "--target", scratch, "--no-deps", "--no-compile", "."],
-    { cwd: REPO_ROOT }
+  // dist-info. pip cannot produce one here: setup.py deliberately blocks
+  // wheel builds outside Nix (and pip install --target builds a wheel
+  // internally). importlib.metadata only reads METADATA, so write the
+  // minimal dist-info directly — same trick as flat layouts everywhere.
+  const version = probe(pythonBinary, [
+    "-c",
+    `import pathlib, re; print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path(${JSON.stringify(
+      path.join(outDir, "repo", "hermes_cli", "__init__.py")
+    )}).read_text(encoding="utf-8")).group(1))`,
+  ]).trim()
+  const distInfo = path.join(sitePackagesDir, `hermes_agent-${version}.dist-info`)
+  fs.mkdirSync(distInfo, { recursive: true })
+  fs.writeFileSync(
+    path.join(distInfo, "METADATA"),
+    `Metadata-Version: 2.1\nName: hermes-agent\nVersion: ${version}\n`
   )
-  const distInfo = fs.readdirSync(scratch).find((name) => name.endsWith(".dist-info"))
-  if (!distInfo) {
-    throw new Error("site-packages: pip produced no dist-info for hermes-agent")
-  }
-  fs.cpSync(path.join(scratch, distInfo), path.join(sitePackagesDir, distInfo), { recursive: true })
-  fs.rmSync(scratch, { recursive: true, force: true })
+  fs.writeFileSync(path.join(distInfo, "INSTALLER"), "hermes-desktop-bundle\n")
 
   // Architecture backstop: import the heaviest native extensions with
   // site-packages on the path. On the native CI runner a wrong-arch
