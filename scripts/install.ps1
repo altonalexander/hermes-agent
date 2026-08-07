@@ -4087,24 +4087,38 @@ function Invoke-PayloadStageRepository {
 
 function Invoke-PayloadStageWheels {
     if (-not (Test-PayloadHas "wheels")) { return $false }
-    Write-Info "Installing Python dependencies from bundled wheelhouse..."
     $wheels = Join-Path $PayloadDir "wheels"
+    $requirements = Join-Path $wheels "requirements-payload.txt"
+    if (-not (Test-Path $requirements)) { return $false }
+    Write-Info "Installing Python dependencies from bundled wheelhouse..."
+    # Deliberately NOT `uv sync`: with --offline --no-index, sync resolves
+    # lock entries against their recorded registry URLs and never consults
+    # --find-links. `uv pip install` honors it. The wheelhouse carries the
+    # requirements export it was filled from plus the build-system wheels
+    # the editable hermes-agent install needs.
     Push-Location $InstallDir
+    $env:VIRTUAL_ENV = Join-Path $InstallDir "venv"
     try {
-        & $script:UvCmd sync --frozen --offline --no-index --find-links $wheels --inexact
+        & $script:UvCmd pip install --offline --no-index --find-links $wheels -r $requirements
         if ($LASTEXITCODE -ne 0) { return $false }
-    } finally { Pop-Location }
+        & $script:UvCmd pip install --offline --no-index --find-links $wheels --no-deps -e .
+        if ($LASTEXITCODE -ne 0) { return $false }
+    } finally {
+        Remove-Item Env:VIRTUAL_ENV -ErrorAction SilentlyContinue
+        Pop-Location
+    }
     Write-Success "Python dependencies installed offline"
     return $true
 }
 
 function Invoke-PayloadStageJs {
     if (-not (Test-PayloadHas "js-prebuilt")) { return $false }
-    $archive = Join-Path $PayloadDir "js-prebuilt.tar.zst"
+    $archive = Join-Path $PayloadDir "js-prebuilt.tar.gz"
     if (-not (Test-Path $archive)) { return $false }
     Write-Info "Unpacking prebuilt JS surfaces (no npm needed)..."
-    # Windows 10 1803 and later ships bsdtar as tar.exe with zstd support.
-    & tar --zstd -xf $archive -C $InstallDir 2>&1 | Out-Null
+    # gzip on purpose: every platform's tar reads -z (macOS bsdtar has no
+    # zstd), and this runs on the user machine.
+    & tar -xzf $archive -C $InstallDir 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { return $false }
     Write-Success "Prebuilt JS surfaces unpacked"
     return $true

@@ -12,7 +12,7 @@
  *   python/                uv-managed CPython (python-build-standalone)
  *   wheels/                the resolved wheelhouse from uv.lock for this platform/arch
  *   node/                  official node dist for this platform/arch
- *   js-prebuilt.tar.zst    PREBUILT JS surfaces + node_modules (ui-tui dist +
+ *   js-prebuilt.tar.gz     PREBUILT JS surfaces + node_modules (ui-tui dist +
  *                          hermes-ink, web_dist). Thus the first launch never
  *                          runs npm install or npm run build.
  *
@@ -476,6 +476,28 @@ function stageWheels(target, outDir, pythonBinary) {
     ["--python", pythonBinary, "pip", ...wheelDownloadArgs({ wheelsDir, sourceBuild: target.sourceBuild || [] })],
     { cwd: REPO_ROOT }
   )
+  // The consumer (install.sh --payload-dir) installs from this exact
+  // requirements export, so it ships beside the wheels. `uv sync` cannot
+  // do that install: with --offline --no-index it resolves lock entries
+  // against their recorded registry URLs and never consults --find-links
+  // (verified against uv 0.11 and 0.12 on the macOS test box). The
+  // consumer therefore runs `uv pip install -r` + `-e . --no-deps`.
+  fs.copyFileSync(path.join(REPO_ROOT, "requirements-payload.txt"), path.join(wheelsDir, "requirements-payload.txt"))
+  // The editable install of hermes-agent builds against pyproject.toml's
+  // [build-system] requires — offline, so those wheels must ship too.
+  const buildRequires = (fs.readFileSync(path.join(REPO_ROOT, "pyproject.toml"), "utf8")
+    .match(/^requires\s*=\s*\[([^\]]*)\]/m)?.[1] || "")
+    .split(",")
+    .map((s) => s.trim().replace(/^["']|["']$/g, ""))
+    .filter(Boolean)
+  if (buildRequires.length === 0) {
+    throw new Error("wheels: no [build-system] requires found in pyproject.toml")
+  }
+  run(
+    "uvx",
+    ["--python", pythonBinary, "pip", "download", "--only-binary", ":all:", "-d", wheelsDir, ...buildRequires],
+    { cwd: REPO_ROOT }
+  )
 
   const bad = wrongArchWheels(fs.readdirSync(wheelsDir), target)
   if (bad.length > 0) {
@@ -527,8 +549,12 @@ function stageJsPrebuilt(outDir) {
     throw new Error("no prebuilt JS surfaces found — run the ui-tui/web builds first")
   }
   fs.writeFileSync(listFile, candidates.join("\n") + "\n")
+  // gzip, not zstd: the consumer is the USER machine's tar at first
+  // launch, and macOS bsdtar has no zstd support (its libarchive is
+  // built without it) — the stage silently degraded to an npm install
+  // that bundled machines cannot run. Every platform's tar reads -z.
   run(hostTarBin(), [
-    "--zstd", "-cf", path.join(outDir, "js-prebuilt.tar.zst"),
+    "-czf", path.join(outDir, "js-prebuilt.tar.gz"),
     "-C", REPO_ROOT, "-T", listFile,
   ])
   fs.rmSync(listFile, { force: true })

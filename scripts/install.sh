@@ -443,34 +443,39 @@ payload_stage_repo() {
     log_success "Checkout materialized offline at $(payload_tag)"
 }
 
-# payload_stage_wheels VENVDIR: syncs the Python dependencies offline from
-# the wheelhouse. Returns 1 to signal "fall back to network uv sync".
+# payload_stage_wheels: installs the Python dependencies offline from the
+# wheelhouse. This deliberately does NOT use `uv sync`: with --offline
+# --no-index, sync resolves lock entries against their recorded registry
+# URLs and never consults --find-links, so every install fails as a cache
+# miss. `uv pip install` honors --find-links. The wheelhouse carries the
+# exact requirements export it was filled from, plus the build-system
+# wheels the editable hermes-agent install needs. Returns 1 to signal
+# "fall back to network uv sync".
 payload_stage_wheels() {
     payload_has wheels || return 1
+    [ -f "$PAYLOAD_DIR/wheels/requirements-payload.txt" ] || return 1
     log_info "Installing Python dependencies from bundled wheelhouse..."
     (
         cd "$INSTALL_DIR"
-        $UV_CMD sync --frozen --offline --no-index \
-            --find-links "$PAYLOAD_DIR/wheels" --inexact
+        export VIRTUAL_ENV="$INSTALL_DIR/venv"
+        $UV_CMD pip install --offline --no-index \
+            --find-links "$PAYLOAD_DIR/wheels" \
+            -r "$PAYLOAD_DIR/wheels/requirements-payload.txt" \
+            && $UV_CMD pip install --offline --no-index \
+                --find-links "$PAYLOAD_DIR/wheels" \
+                --no-deps -e .
     ) || return 1
     log_success "Python dependencies installed offline"
 }
 
 # payload_stage_js: unpacks the prebuilt JS surfaces (ui-tui dist plus
-# node_modules, and web_dist) from a tar.zst archive. The function tries tar
-# with zstd support first. If that fails, it uses unzstd.
+# node_modules, and web_dist) from a tar.gz archive. gzip on purpose:
+# macOS bsdtar reads no zstd, and this runs on the user machine.
 payload_stage_js() {
     payload_has js-prebuilt || return 1
-    [ -f "$PAYLOAD_DIR/js-prebuilt.tar.zst" ] || return 1
+    [ -f "$PAYLOAD_DIR/js-prebuilt.tar.gz" ] || return 1
     log_info "Unpacking prebuilt JS surfaces (no npm needed)..."
-    if tar --zstd -tf "$PAYLOAD_DIR/js-prebuilt.tar.zst" >/dev/null 2>&1; then
-        tar --zstd -xf "$PAYLOAD_DIR/js-prebuilt.tar.zst" -C "$INSTALL_DIR" || return 1
-    elif command -v unzstd >/dev/null 2>&1; then
-        unzstd -c "$PAYLOAD_DIR/js-prebuilt.tar.zst" | tar -xf - -C "$INSTALL_DIR" || return 1
-    else
-        log_warn "No zstd support available for js-prebuilt payload"
-        return 1
-    fi
+    tar -xzf "$PAYLOAD_DIR/js-prebuilt.tar.gz" -C "$INSTALL_DIR" || return 1
     log_success "Prebuilt JS surfaces unpacked"
 }
 
