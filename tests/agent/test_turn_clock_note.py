@@ -34,6 +34,19 @@ def _stub_runtime_main():
 NOTE = "<current_time>Sunday, November 01, 2026 at 07:04 MST (America/Denver)</current_time>"
 
 
+def _patch_clock(**kwargs):
+    """Patch the clock on the module ``build_turn_context`` closes over.
+
+    Not by dotted name: tests/agent/test_empty_tool_name_loop_dampening.py
+    purges sys.modules of ``hermes_*``/``agent.*``, after which the name
+    resolves to a different module object than this already-imported function
+    uses, and the patch silently does nothing.
+    """
+    return patch.object(
+        build_turn_context.__globals__["hermes_time"], "current_time_note", **kwargs
+    )
+
+
 class TestRendering:
     def test_names_both_abbreviation_and_iana_zone(self):
         """The model must never have to infer a zone or do offset arithmetic."""
@@ -73,7 +86,7 @@ class TestDeliveredOnTheTurn:
     def test_note_rides_the_api_content_sidecar(self):
         agent = _FakeAgent()
         with patch("hermes_cli.plugins.invoke_hook", return_value=[]), \
-             patch("hermes_time.current_time_note", return_value=NOTE):
+             _patch_clock(return_value=NOTE):
             ctx = _build(agent)
         msg = ctx.messages[ctx.current_turn_user_idx]
         # Stored content stays clean; only the API copy carries the clock.
@@ -84,7 +97,7 @@ class TestDeliveredOnTheTurn:
         """The cache invariant: persisted sidecar == bytes on the wire."""
         agent = _FakeAgent()
         with patch("hermes_cli.plugins.invoke_hook", return_value=[]), \
-             patch("hermes_time.current_time_note", return_value=NOTE):
+             _patch_clock(return_value=NOTE):
             ctx = _build(agent)
             msg = ctx.messages[ctx.current_turn_user_idx]
             rebuilt = compose_user_api_content(
@@ -102,7 +115,7 @@ class TestDeliveredOnTheTurn:
         """
         agent = _FakeAgent()
         with patch("hermes_cli.plugins.invoke_hook", return_value=[]), \
-             patch("hermes_time.current_time_note", return_value=NOTE) as spy:
+             _patch_clock(return_value=NOTE) as spy:
             ctx = _build(agent)
             # Re-composing must not consult the clock again.
             compose_user_api_content(
@@ -118,7 +131,7 @@ class TestDeliveredOnTheTurn:
             {"type": "image_url", "image_url": {"url": "https://x/img.png"}},
         ]
         with patch("hermes_cli.plugins.invoke_hook", return_value=[]), \
-             patch("hermes_time.current_time_note", return_value=NOTE):
+             _patch_clock(return_value=NOTE):
             ctx = _build(agent, user_message=content)
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"][-1] == {"type": "text", "text": NOTE}
@@ -126,11 +139,29 @@ class TestDeliveredOnTheTurn:
     def test_clock_failure_does_not_break_the_turn(self):
         agent = _FakeAgent()
         with patch("hermes_cli.plugins.invoke_hook", return_value=[]), \
-             patch("hermes_time.current_time_note", side_effect=RuntimeError("boom")):
+             _patch_clock(side_effect=RuntimeError("boom")):
             ctx = _build(agent)
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"] == "hello"
         assert "api_content" not in msg
+
+
+def _reset_live_clock_cache() -> None:
+    """Clear the zone cache on every live ``hermes_time`` module object.
+
+    Another test module purges sys.modules of ``hermes_*``, so the object this
+    file imported at collection time and the one ``build_system_prompt_parts``
+    resolves at call time can be different, each with its own cache. Resetting
+    only ours would leave the one that actually answers still holding a stale
+    zone.
+    """
+    import importlib
+
+    hermes_time.reset_cache()
+    try:
+        importlib.import_module("hermes_time").reset_cache()
+    except Exception:
+        pass
 
 
 def _volatile_parts(zone: str) -> str:
@@ -144,9 +175,9 @@ def _volatile_parts(zone: str) -> str:
          patch("run_agent.build_nous_subscription_prompt", return_value=""), \
          patch("run_agent.build_environment_hints", return_value=""), \
          patch("run_agent.build_context_files_prompt", return_value=""):
-        hermes_time.reset_cache()
+        _reset_live_clock_cache()
         parts = build_system_prompt_parts(_make_agent())
-    hermes_time.reset_cache()
+    _reset_live_clock_cache()
     return parts["volatile"]
 
 

@@ -128,8 +128,19 @@ def _no_clock_note():
     ``build_turn_context`` appends it to every turn, which would otherwise
     appear in each exact-bytes assertion below and obscure what these tests are
     about. The note has its own coverage in tests/agent/test_turn_clock_note.py.
+
+    Patched on the module object ``build_turn_context`` actually closes over,
+    NOT by the dotted name: tests/agent/test_empty_tool_name_loop_dampening.py
+    purges sys.modules of ``hermes_*``/``agent.*`` to force fresh imports, so
+    after it runs ``patch("hermes_time.current_time_note")`` would patch a
+    different module object than this already-imported function uses, and the
+    note would leak into the assertions below.
     """
-    with patch("hermes_time.current_time_note", return_value=""):
+    with patch.object(
+        build_turn_context.__globals__["hermes_time"],
+        "current_time_note",
+        return_value="",
+    ):
         yield
 
 
