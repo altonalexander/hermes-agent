@@ -3972,12 +3972,16 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         # is a mid-conversation message that is NOT part of the cached prefix, so a
         # date here never affects prompt-cache stability. Resolved defensively —
         # a clock failure must never block compaction.
+        # The zone is named alongside the date so a summary written near
+        # midnight can't be read as a different day than the agent meant.
         try:
-            from hermes_time import now as _hermes_now
+            from hermes_time import now as _hermes_now, timezone_name as _hermes_tz_name
 
             _today_str = _hermes_now().strftime("%Y-%m-%d")
+            _today_zone = _hermes_tz_name()
         except Exception:  # pragma: no cover - clock resolution is best-effort
             _today_str = ""
+            _today_zone = ""
 
         # Preamble shared by both first-compaction and iterative-update prompts.
         # Keep the wording deliberately plain: Azure/OpenAI-compatible content
@@ -4071,7 +4075,9 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
         # summarizer is never handed an empty date placeholder.
         if _today_str:
             _temporal_anchoring_rule = (
-                f"\nTEMPORAL ANCHORING: The current date is {_today_str}. When an "
+                f"\nTEMPORAL ANCHORING: The current date is {_today_str}"
+                + (f" ({_today_zone})" if _today_zone else "")
+                + ". When an "
                 "action has already been carried out, phrase it as a completed, "
                 "dated, past-tense fact rather than an open instruction. For "
                 'example, rewrite "email John about the proposal" as "Sent the '

@@ -133,3 +133,38 @@ def now() -> datetime:
     return datetime.now().astimezone()
 
 
+def timezone_name() -> str:
+    """Return the resolved IANA zone name, or the server-local zone's name."""
+    get_timezone()  # populate the cache
+    if _cached_tz is not None and _cached_tz_name:
+        return _cached_tz_name
+    local = datetime.now().astimezone().tzinfo
+    return str(local) if local else "UTC"
+
+
+def current_time_note() -> str:
+    """Render the current time for injection into the model's context.
+
+    Why this exists
+    ---------------
+    The system prompt carries a date-only line and is built once per session
+    (rebuilt only after compaction), deliberately, to keep the provider's
+    prefix KV cache byte-stable. That means the model has no idea what *time*
+    it is, no idea which zone the date is in, and on a session running past
+    midnight the date it does have is simply wrong.
+
+    So the clock belongs on the *current turn* instead, where the bytes change
+    every turn anyway and no cache boundary is disturbed. Callers must compute
+    this once per turn and thread it through — never per-message — so the
+    persisted sidecar and the bytes on the wire cannot drift.
+
+    Formatted for a reader, not a parser: an explicit zone abbreviation and
+    IANA name so the model never has to infer a zone or do offset arithmetic.
+    """
+    stamp = now()
+    zone = timezone_name()
+    abbreviation = stamp.strftime("%Z") or zone
+    rendered = stamp.strftime("%A, %B %d, %Y at %H:%M")
+    return f"<current_time>{rendered} {abbreviation} ({zone})</current_time>"
+
+

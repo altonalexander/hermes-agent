@@ -1,16 +1,20 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   calendarBucket,
   DAY,
+  fmtDateTime,
+  fmtDayTime,
   fmtMonth,
   fmtMonthYear,
   formatAgo,
+  getDisplayZone,
   HOUR,
   MINUTE,
   nominalDayStart,
   SECOND,
-  sessionBucketLabel
+  sessionBucketLabel,
+  setDisplayZone
 } from './time'
 
 const labels = {
@@ -147,5 +151,58 @@ describe('sessionBucketLabel', () => {
     }
 
     expect(sessionBucketLabel(monthYearBucket, labels)).toBe(fmtMonthYear.format(monthYearBucket.at))
+  })
+})
+
+describe('display timezone', () => {
+  afterEach(() => {
+    setDisplayZone(undefined)
+  })
+
+  // 2026-11-01T14:00Z is 07:00 in Denver (MST) and 23:00 in Tokyo (JST) — a
+  // different hour *and* a different calendar day, so a formatter that ignored
+  // the configured zone could not accidentally pass this.
+  const instant = Date.UTC(2026, 10, 1, 14, 0)
+
+  it('renders in the configured zone rather than the OS zone', () => {
+    setDisplayZone('America/Denver')
+    const denver = fmtDayTime.format(instant)
+
+    setDisplayZone('Asia/Tokyo')
+    const tokyo = fmtDayTime.format(instant)
+
+    expect(denver).not.toBe(tokyo)
+    expect(denver).toContain('Nov 1')
+    expect(tokyo).toContain('Nov 1')
+    expect(denver).toContain('7')
+    expect(tokyo).toContain('11')
+  })
+
+  it('labels the zone so a timestamp is never ambiguous', () => {
+    setDisplayZone('America/Denver')
+    expect(fmtDayTime.format(instant)).toMatch(/MST|GMT-7/)
+    expect(fmtDateTime.format(instant)).toMatch(/MST|GMT-7/)
+  })
+
+  it('rebuilds memoized formatters when the zone changes', () => {
+    setDisplayZone('America/Denver')
+    const first = fmtDateTime.format(instant)
+    setDisplayZone('Asia/Tokyo')
+
+    expect(fmtDateTime.format(instant)).not.toBe(first)
+  })
+
+  it('falls back to the OS zone for an invalid zone name', () => {
+    setDisplayZone('Not/AZone')
+
+    expect(() => fmtDayTime.format(instant)).not.toThrow()
+  })
+
+  it('tracks the current zone and treats blank as unset', () => {
+    setDisplayZone('  ')
+    expect(getDisplayZone()).toBeUndefined()
+
+    setDisplayZone('Asia/Tokyo')
+    expect(getDisplayZone()).toBe('Asia/Tokyo')
   })
 })

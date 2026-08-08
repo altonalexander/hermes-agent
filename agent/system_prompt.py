@@ -540,15 +540,26 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         except Exception:
             pass
 
-    from hermes_time import now as _hermes_now
+    from hermes_time import now as _hermes_now, timezone_name as _hermes_tz_name
     now = _hermes_now()
     # Date-only (not minute-precision) so the system prompt is byte-stable
     # for the full day.  Minute-precision changes invalidate prefix-cache KV
     # on every rebuild path (compression boundary, fresh-agent gateway turns,
-    # session resume without a stored prompt).  The model can still query the
-    # exact wall-clock time via tools when it actually needs it.
+    # session resume without a stored prompt).
     # Credit: @iamfoz (PR #20451).
-    timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')}"
+    #
+    # The zone NAME is safe to include: it is stable for the whole day (and
+    # almost always for the whole session), so it costs nothing in cache terms
+    # while telling the model which clock this date is on. The live time is
+    # delivered per-turn instead, via hermes_time.current_time_note() on the
+    # user message — see agent/turn_context.py.
+    try:
+        _tz_label = f" ({_hermes_tz_name()})"
+    except Exception:
+        _tz_label = ""
+    timestamp_line = (
+        f"Conversation started: {now.strftime('%A, %B %d, %Y')}{_tz_label}"
+    )
     if agent.pass_session_id and agent.session_id:
         timestamp_line += f"\nSession ID: {agent.session_id}"
     if agent.model:

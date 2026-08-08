@@ -4,6 +4,7 @@ import { setTerminalFontFamilyFromConfig } from '@/app/right-sidebar/terminal/te
 import { getHermesConfig, getHermesConfigDefaults } from '@/hermes'
 import { BUILTIN_PERSONALITIES, normalizePersonalityValue, personalityNamesFromConfig } from '@/lib/chat-runtime'
 import { normalize } from '@/lib/text'
+import { setDisplayZone } from '@/lib/time'
 import {
   getComposerSelectionGeneration,
   getCurrentModelSource,
@@ -110,6 +111,10 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
         setVoiceMaxRecordingSeconds(recordingLimit(config.voice?.max_recording_seconds))
         setSttEnabled(config.stt?.enabled !== false)
         setTerminalFontFamilyFromConfig(config.terminal?.font_family)
+        // Render every timestamp in the user's configured Hermes timezone
+        // rather than the OS zone. Empty/absent falls back to the OS zone,
+        // which is the pre-configuration behavior.
+        setDisplayZone(typeof config.timezone === 'string' ? config.timezone : undefined)
         applyAutoSpeakFromConfig(config)
         applyVoiceStopPhraseFromConfig(config)
         applyThinkingSoundFromConfig(config)

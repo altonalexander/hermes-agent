@@ -1477,7 +1477,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "schedule": {
                 "type": "string",
-                "description": "REQUIRED for action=create. For create/update: '30m', 'every 2h', '0 9 * * *', or ISO timestamp. Examples: '30m' (every 30 minutes), 'every 2h' (every 2 hours), '0 9 * * *' (daily at 9am), '2026-06-01T09:00:00' (one-shot). You MUST include this field when action=create."
+                "description": "REQUIRED for action=create. For create/update: '30m', 'every 2h', '0 9 * * *', or ISO timestamp. Examples: '30m' (every 30 minutes), 'every 2h' (every 2 hours), '0 9 * * *' (daily at 9am UTC), '2026-06-01T09:00:00' (one-shot, 09:00 UTC). TIMEZONE: cron schedules and bare ISO timestamps are always interpreted in UTC, NOT the user's local timezone. When the user asks for a local time, convert it to UTC yourself using <current_time> (which gives the current time and their zone), and state both times back to them so they can confirm."
             },
             "name": {
                 "type": "string",

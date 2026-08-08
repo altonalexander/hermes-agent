@@ -245,6 +245,18 @@ def _stub_runtime_main():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _no_clock_note():
+    """Silence the per-turn <current_time> note for this module.
+
+    ``build_turn_context`` appends it to every turn, which would otherwise
+    appear in each exact-bytes assertion below and obscure what these tests are
+    about. The note has its own coverage in tests/agent/test_turn_clock_note.py.
+    """
+    with patch("hermes_time.current_time_note", return_value=""):
+        yield
+
+
 class TestPrologueStamping:
     def test_stamps_api_content_from_plugin_context(self):
         agent = _FakeAgent()

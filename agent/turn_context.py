@@ -31,6 +31,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
+import hermes_time
+
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
@@ -1224,6 +1226,36 @@ def build_turn_context(
                 plugin_user_context + "\n\n" + _gateway_notes
                 if plugin_user_context
                 else _gateway_notes
+            )
+
+    # Current time. Rides the same user-message injection channel as the
+    # gateway notes above, for the same reason: the system prompt is built once
+    # per session and must stay byte-stable for the provider's prefix cache, so
+    # a clock cannot live there. Here the bytes change every turn regardless.
+    #
+    # Computed ONCE, here — deliberately not inside compose_user_api_content,
+    # which runs twice per turn (the sidecar stamp in the prologue and the
+    # api_messages build in conversation_loop). A clock read in that function
+    # could return different minutes to the two calls and break the invariant
+    # that the persisted sidecar equals the bytes on the wire.
+    try:
+        _time_note = hermes_time.current_time_note()
+    except Exception:
+        _time_note = ""
+    if _time_note:
+        _time_turn_content = (
+            messages[current_turn_user_idx].get("content")
+            if 0 <= current_turn_user_idx < len(messages)
+            and isinstance(messages[current_turn_user_idx], dict)
+            else None
+        )
+        if isinstance(_time_turn_content, list):
+            append_notes_to_multimodal_content(_time_turn_content, _time_note)
+        else:
+            plugin_user_context = (
+                plugin_user_context + "\n\n" + _time_note
+                if plugin_user_context
+                else _time_note
             )
 
     # Per-turn file-mutation verifier state.

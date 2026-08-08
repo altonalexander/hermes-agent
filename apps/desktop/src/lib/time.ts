@@ -1,34 +1,112 @@
-// Canonical time/date formatting. Shared `Intl` instances (created once, not
-// per-render) + relative-time helpers. Every surface that shows a timestamp or
-// an age pulls from here so the rendered strings stay consistent app-wide.
+// Canonical time/date formatting. Shared `Intl` instances (built once and
+// memoized, never per-render) + relative-time helpers. Every surface that shows
+// a timestamp or an age pulls from here so the rendered strings stay consistent
+// app-wide — and so they all follow the user's configured Hermes timezone
+// rather than silently rendering in the OS zone. See `setDisplayZone`.
 
 export const SECOND = 1000
 export const MINUTE = 60_000
 export const HOUR = 3_600_000
 export const DAY = 86_400_000
 
-// ── Absolute date/time formatters ──────────────────────────────────────────
-// `hh:mm` clock (thread today/yesterday lines).
-export const fmtClock = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' })
+// ── Display timezone ───────────────────────────────────────────────────────
+// Hermes has a user-configured timezone (the `timezone` key in config.yaml,
+// editable in Settings). The desktop app used to ignore it entirely and render
+// every timestamp in the OS zone, unlabelled — so a user whose machine and
+// Hermes disagreed could not tell which clock they were reading.
+//
+// `setDisplayZone` installs the zone the gateway reports; `undefined` means
+// "use the OS zone", which is the pre-configuration behavior and the fallback
+// if the gateway never answers.
+let displayZone: string | undefined
+const formatterCache = new Map<string, Intl.DateTimeFormat>()
 
-// Compact "day + clock", no year/seconds (artifacts, thread fallback, cron runs).
-export const fmtDayTime = new Intl.DateTimeFormat(undefined, {
+export function setDisplayZone(zone: string | undefined): void {
+  const next = zone && zone.trim() ? zone.trim() : undefined
+
+  if (next === displayZone) {
+    return
+  }
+
+  displayZone = next
+  // The formatters below are built once and reused (never per-render), so a
+  // zone change has to invalidate them explicitly.
+  formatterCache.clear()
+}
+
+export function getDisplayZone(): string | undefined {
+  return displayZone
+}
+
+// Lazily build + memoize a formatter in the current display zone. An invalid
+// zone name (a stale or malformed config value) must not blank out every
+// timestamp in the app, so fall back to the OS zone.
+function formatter(key: string, options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
+  const cached = formatterCache.get(key)
+
+  if (cached) {
+    return cached
+  }
+
+  let built: Intl.DateTimeFormat
+
+  try {
+    built = new Intl.DateTimeFormat(undefined, displayZone ? { ...options, timeZone: displayZone } : options)
+  } catch {
+    built = new Intl.DateTimeFormat(undefined, options)
+  }
+
+  formatterCache.set(key, built)
+
+  return built
+}
+
+// A thin memoizing wrapper keeps the original `.format(...)` API while letting
+// the zone change at runtime. These are re-exported from the SDK
+// (src/sdk/index.ts), so the rest of the commonly-used Intl.DateTimeFormat
+// surface is proxied too rather than silently disappearing for consumers.
+const lazyFormat = (key: string, options: Intl.DateTimeFormatOptions) => ({
+  format: (value: Date | number) => formatter(key, options).format(value),
+  formatToParts: (value: Date | number) => formatter(key, options).formatToParts(value),
+  resolvedOptions: () => formatter(key, options).resolvedOptions()
+})
+
+// ── Absolute date/time formatters ──────────────────────────────────────────
+// `hh:mm` clock (thread today/yesterday lines). No zone suffix: these sit under
+// an explicit "Today"/"Yesterday" heading where a label would be pure noise.
+export const fmtClock = lazyFormat('clock', { hour: 'numeric', minute: '2-digit' })
+
+// Compact "day + clock" (artifacts, thread fallback, cron runs). Zone-labelled —
+// this is the formatter cron next-run times flow through, and an unlabelled
+// cron time is exactly the ambiguity worth removing.
+export const fmtDayTime = lazyFormat('dayTime', {
   day: 'numeric',
   hour: 'numeric',
   minute: '2-digit',
-  month: 'short'
+  month: 'short',
+  timeZoneName: 'short'
 })
 
-// Medium date + short time (command center session detail).
-export const fmtDateTime = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+// Medium date + short time (command center session detail). Spelled out as
+// individual components rather than dateStyle/timeStyle because those cannot be
+// combined with `timeZoneName`.
+export const fmtDateTime = lazyFormat('dateTime', {
+  day: 'numeric',
+  hour: 'numeric',
+  minute: '2-digit',
+  month: 'short',
+  timeZoneName: 'short',
+  year: 'numeric'
+})
 
-// Date only, "5 Jun 2026" (starmap tooltip).
-export const fmtDate = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short', year: 'numeric' })
+// Date only, "5 Jun 2026" (starmap tooltip). No time, so no zone label — but it
+// still resolves in the display zone so the *date* can't be off by one.
+export const fmtDate = lazyFormat('date', { day: 'numeric', month: 'short', year: 'numeric' })
 
 // Month name alone / with year — session-list date-bucket dividers ("September",
 // "September 2025").
-export const fmtMonth = new Intl.DateTimeFormat(undefined, { month: 'long' })
-export const fmtMonthYear = new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' })
+export const fmtMonth = lazyFormat('month', { month: 'long' })
+export const fmtMonthYear = lazyFormat('monthYear', { month: 'long', year: 'numeric' })
 
 // ── Relative time ──────────────────────────────────────────────────────────
 const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto', style: 'short' })

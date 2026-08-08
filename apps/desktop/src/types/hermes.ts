@@ -322,6 +322,9 @@ export interface GatewayReadyPayload {
 }
 
 export interface HermesConfig {
+  /** IANA zone name (e.g. "America/Denver"). Empty/absent means server-local.
+   *  Drives every rendered timestamp — see `setDisplayZone` in lib/time.ts. */
+  timezone?: string
   agent?: {
     reasoning_effort?: string
     personalities?: Record<string, unknown>
