@@ -164,6 +164,27 @@ def _make_agent_with_cooldown(db_path, session_id, *, cooldown_until=None):
 
 
 @pytest.fixture(autouse=True)
+def _no_clock_note():
+    """Silence the per-turn <current_time> note for this module.
+
+    ``build_turn_context`` appends it to every turn, so it would show up in the
+    exact message-dict assertions below (as an ``api_content`` sidecar, or an
+    extra text part on multimodal content) and obscure what these tests are
+    about. The note has its own coverage in tests/agent/test_turn_clock_note.py.
+
+    Patched on the module object ``build_turn_context`` closes over rather than
+    by dotted name — see the same fixture in test_gateway_turn_sidecar.py for
+    why (sys.modules purging in another test module).
+    """
+    with patch.object(
+        build_turn_context.__globals__["hermes_time"],
+        "current_time_note",
+        return_value="",
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _stub_runtime_main():
     """``build_turn_context`` calls ``auxiliary_client.set_runtime_main`` as a
     production side effect (telling aux tools the live main provider/model).
