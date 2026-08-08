@@ -115,6 +115,36 @@ export function AutoField({
 
   if (schema.type === "select") {
     const options = (schema.options as string[]) ?? [];
+
+    // The backend marks large option sets `searchable` (most visibly
+    // `timezone`, which enumerates ~590 IANA zones — see
+    // hermes_cli/web_server.py `_timezone_options`). Rendering those as a plain
+    // Select is unusable: the user has to scroll a 590-row dropdown to find
+    // their own timezone. A datalist-backed input gives native type-to-filter
+    // with no extra dependency, and lets `clearable` fields be emptied by
+    // simply clearing the text.
+    const searchable = schema.searchable === true && options.length > 0;
+    if (searchable) {
+      const listId = `autofield-options-${schemaKey.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+      return (
+        <div className="grid gap-1.5">
+          <Label className="text-sm">{label}</Label>
+          <FieldHint schema={schema} schemaKey={schemaKey} />
+          <Input
+            list={listId}
+            value={String(value ?? "")}
+            placeholder={schema.clearable === true ? "(system default)" : undefined}
+            onChange={(e) => onChange(e.target.value)}
+          />
+          <datalist id={listId}>
+            {options.filter(Boolean).map((opt) => (
+              <option key={opt} value={opt} />
+            ))}
+          </datalist>
+        </div>
+      );
+    }
+
     return (
       <div className="grid gap-1.5">
         <Label className="text-sm">{label}</Label>

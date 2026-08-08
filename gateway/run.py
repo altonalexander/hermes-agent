@@ -2277,7 +2277,34 @@ if _config_path.exists():
         # Timezone: bridge config.yaml → HERMES_TIMEZONE env var.
         _tz_cfg = _cfg.get("timezone", "")
         if _tz_cfg and isinstance(_tz_cfg, str):
-            os.environ["HERMES_TIMEZONE"] = _tz_cfg.strip()
+            _tz_cfg = _tz_cfg.strip()
+            # HERMES_TIMEZONE wins over config.yaml in hermes_time's resolution
+            # order, so an externally-set env var silently disables the
+            # dashboard/desktop timezone picker. Say so rather than letting the
+            # user conclude the setting is broken.
+            _tz_env_preset = os.environ.get("HERMES_TIMEZONE", "").strip()
+            if _tz_env_preset and _tz_env_preset != _tz_cfg:
+                # This block runs at import time, before the module-level
+                # `logger` is bound further down — fetch one locally.
+                logging.getLogger(__name__).warning(
+                    "Timezone conflict: HERMES_TIMEZONE=%r (environment) overrides "
+                    "timezone=%r from config.yaml. The Settings timezone picker will "
+                    "appear to have no effect until the environment variable is "
+                    "removed.",
+                    _tz_env_preset,
+                    _tz_cfg,
+                )
+            else:
+                os.environ["HERMES_TIMEZONE"] = _tz_cfg
+        # Drop any zone resolved before this bridge ran. hermes_time caches on
+        # first use, so an early now() during import would otherwise pin the
+        # pre-bridge value for the whole process lifetime.
+        try:
+            import hermes_time
+
+            hermes_time.reset_cache()
+        except Exception:
+            pass
         # Security settings
         _security_cfg = _cfg.get("security", {})
         if isinstance(_security_cfg, dict):

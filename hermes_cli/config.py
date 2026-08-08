@@ -3561,6 +3561,29 @@ _COMMENTED_SECTIONS = """
 """
 
 
+def _invalidate_timezone_cache() -> None:
+    """Drop hermes_time's cached zone after a config write.
+
+    ``hermes_time`` resolves the configured timezone once and caches it for the
+    process lifetime. Without this, editing the timezone — from the dashboard,
+    the desktop app, or ``hermes config set`` — appears to do nothing in any
+    long-lived process (notably the gateway) until it restarts.
+
+    Unconditional rather than gated on "did timezone change": the cost is a
+    single re-resolution on the next ``now()``, which is cheap and reads through
+    the raw-config cache, and gating would have to reason about managed-scope
+    overlays and env precedence to be correct.
+
+    Fails open — a config write must never fail because of a display concern.
+    """
+    try:
+        import hermes_time
+
+        hermes_time.reset_cache()
+    except Exception:
+        pass
+
+
 def save_config(
     config: Dict[str, Any],
     *,
@@ -3675,6 +3698,7 @@ def save_config(
         _secure_file(config_path)
         _RAW_CONFIG_CACHE.pop(str(config_path), None)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+        _invalidate_timezone_cache()
 
 
 def _parse_env_value(raw_value: str) -> str:
@@ -5058,7 +5082,8 @@ def set_config_value(key: str, value: str, force: bool = False):
     ensure_hermes_home()
     from utils import atomic_yaml_write
     atomic_yaml_write(config_path, user_config, sort_keys=False)
-    
+    _invalidate_timezone_cache()
+
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
     env_var = terminal_config_env_var_for_key(key)
@@ -5186,6 +5211,7 @@ def unset_config_value(key: str):
     ensure_hermes_home()
     from utils import atomic_yaml_write
     atomic_yaml_write(config_path, user_config, sort_keys=False)
+    _invalidate_timezone_cache()
     print(f"✓ Unset {key} from {config_path}")
 
 

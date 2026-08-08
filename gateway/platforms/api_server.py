@@ -146,6 +146,55 @@ def _hermes_version() -> str:
         return "dev"
 
 
+def _resolved_timezone_info() -> Dict[str, Any]:
+    """Report the timezone this Hermes resolved, for clients that can't read config.
+
+    The workflows and dashboard containers deliberately cannot see
+    ``config.yaml`` (it holds provider credentials), so they have no way to
+    learn the user's configured zone. Publishing it read-only here is what lets
+    them render and reason in the same zone the agent uses.
+
+    Note this is the *display* zone. Cron deliberately runs on UTC regardless —
+    see cron/clock.py — so schedulers must not read this as their clock.
+
+    Never raises: a timezone probe must not be able to break the capabilities
+    or health endpoints.
+    """
+    from datetime import datetime, timezone as _timezone
+
+    info: Dict[str, Any] = {
+        "name": "UTC",
+        "utc_offset": "+00:00",
+        "abbreviation": "UTC",
+        "source": "fallback",
+        "scheduler": "UTC",
+    }
+    try:
+        import hermes_time
+
+        resolved = hermes_time.get_timezone()
+        now = hermes_time.now()
+        if resolved is not None:
+            info["name"] = str(resolved)
+            info["source"] = (
+                "environment" if os.environ.get("HERMES_TIMEZONE", "").strip() else "config"
+            )
+        else:
+            # No zone configured — hermes_time falls back to server-local.
+            info["name"] = str(now.tzinfo) if now.tzinfo else "UTC"
+            info["source"] = "server_local"
+        offset = now.utcoffset() or (datetime.now(_timezone.utc).utcoffset())
+        if offset is not None:
+            total = int(offset.total_seconds() // 60)
+            sign = "+" if total >= 0 else "-"
+            hours, minutes = divmod(abs(total), 60)
+            info["utc_offset"] = f"{sign}{hours:02d}:{minutes:02d}"
+        info["abbreviation"] = now.strftime("%Z") or info["name"]
+    except Exception:
+        logger.debug("timezone probe failed; reporting UTC", exc_info=True)
+    return info
+
+
 # Default settings
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
@@ -2932,9 +2981,19 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
-        """GET /health — simple health check."""
+        """GET /health — simple health check.
+
+        Carries ``timezone`` so sibling containers can resolve the user's zone
+        without a credential; /v1/capabilities is bearer-gated and they have no
+        access to config.yaml.
+        """
         return web.json_response(
-            {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
+            {
+                "status": "ok",
+                "platform": "hermes-agent",
+                "version": _hermes_version(),
+                "timezone": _resolved_timezone_info(),
+            }
         )
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
@@ -3100,6 +3159,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "type": "bearer",
                 "required": bool(self._api_key),
             },
+            "timezone": _resolved_timezone_info(),
             "runtime": {
                 "mode": "server_agent",
                 "tool_execution": "server",
