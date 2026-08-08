@@ -28,6 +28,10 @@ from rich.markup import escape as _escape
 from rich.panel import Panel
 
 from hermes_constants import display_hermes_home, is_termux as _is_termux_environment
+from cron.clock import (
+    describe_schedule_zone as _describe_cron_zone,
+    format_iso_dual as _fmt_cron_time,
+)
 from agent.turn_context import extract_api_content_sidecar
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL,
@@ -1641,7 +1645,7 @@ class CLICommandsMixin:
                         print(f"      Skills: {', '.join(job['skills'])}")
                     print(f"      {job.get('prompt_preview', '')}")
                     if job.get("next_run_at"):
-                        print(f"      Next: {job['next_run_at']}")
+                        print(f"      Next: {_fmt_cron_time(job['next_run_at'])}")
                     print()
             else:
                 print("  No scheduled jobs. Use '/cron add' to create one.")
@@ -1668,12 +1672,12 @@ class CLICommandsMixin:
                 print(f"  Name: {job['name']}")
                 print(f"  State: {job.get('state', '?')}")
                 print(f"  Schedule: {job['schedule']} ({job.get('repeat', '?')})")
-                print(f"  Next run: {job.get('next_run_at', 'N/A')}")
+                print(f"  Next run: {_fmt_cron_time(job.get('next_run_at'), fallback='N/A')}")
                 if job.get("skills"):
                     print(f"  Skills: {', '.join(job['skills'])}")
                 print(f"  Prompt: {job.get('prompt_preview', '')}")
                 if job.get("last_run_at"):
-                    print(f"  Last run: {job['last_run_at']} ({job.get('last_status', '?')})")
+                    print(f"  Last run: {_fmt_cron_time(job['last_run_at'])} ({job.get('last_status', '?')})")
                 print()
             return
 
@@ -1702,7 +1706,8 @@ class CLICommandsMixin:
                 print(f"  Schedule: {result['schedule']}")
                 if result.get("skills"):
                     print(f"  Skills: {', '.join(result['skills'])}")
-                print(f"  Next run: {result['next_run_at']}")
+                print(f"  Next run: {_fmt_cron_time(result['next_run_at'])}")
+                print(f"  {_describe_cron_zone()}")
             else:
                 print(f"(x_x) Failed to create job: {result.get('error')}")
             return
@@ -1770,7 +1775,7 @@ class CLICommandsMixin:
                 print(f"(^_^)b Paused job: {result['job']['name']} ({job_id})")
             elif action == "resume":
                 print(f"(^_^)b Resumed job: {result['job']['name']} ({job_id})")
-                print(f"  Next run: {result['job'].get('next_run_at')}")
+                print(f"  Next run: {_fmt_cron_time(result['job'].get('next_run_at'))}")
             elif action == "run":
                 print(f"(^_^)b Triggered job: {result['job']['name']} ({job_id})")
                 print("  It will run on the next scheduler tick.")

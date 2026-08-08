@@ -98,6 +98,7 @@ def _warn_if_gateway_not_running() -> None:
 
 def cron_list(show_all: bool = False):
     """List all scheduled jobs."""
+    from cron.clock import describe_schedule_zone, format_iso_dual
     from cron.jobs import list_jobs
 
     jobs = list_jobs(include_disabled=show_all)
@@ -111,6 +112,7 @@ def cron_list(show_all: bool = False):
     print(color("┌─────────────────────────────────────────────────────────────────────────┐", Colors.CYAN))
     print(color("│                         Scheduled Jobs                                  │", Colors.CYAN))
     print(color("└─────────────────────────────────────────────────────────────────────────┘", Colors.CYAN))
+    print(color(f"  {describe_schedule_zone()}", Colors.DIM))
     print()
 
     from cron.jobs import effective_job_state
@@ -122,7 +124,7 @@ def cron_list(show_all: bool = False):
         # Derive from the scheduler-honoured flag — never show [paused] when
         # enabled=true (half-paused contradiction must not look frozen).
         state = effective_job_state(job)
-        next_run = job.get("next_run_at", "?")
+        next_run = format_iso_dual(job.get("next_run_at"))
 
         # `repeat` may be present-but-null in the job record (e.g. a one-shot
         # job persisted with "repeat": null), so coalesce to {} rather than
@@ -177,7 +179,7 @@ def cron_list(show_all: bool = False):
         # Execution history
         last_status = job.get("last_status")
         if last_status:
-            last_run = job.get("last_run_at", "?")
+            last_run = format_iso_dual(job.get("last_run_at"))
             if last_status == "ok":
                 status_display = color("ok", Colors.GREEN)
             else:
@@ -333,10 +335,12 @@ def _print_active_jobs_summary(jobs) -> None:
     """Print the '<N> active job(s)' + next-run line shared by every status
     path (built-in ticker AND external provider)."""
     if jobs:
+        from cron.clock import format_iso_dual
+
         next_runs = [j.get("next_run_at") for j in jobs if j.get("next_run_at")]
         print(f"  {len(jobs)} active job(s)")
         if next_runs:
-            print(f"  Next run: {min(next_runs)}")
+            print(f"  Next run: {format_iso_dual(min(next_runs))}")
     else:
         print("  No active jobs")
 
@@ -384,7 +388,12 @@ def cron_create(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
-    print(f"  Next run: {result['next_run_at']}")
+    from cron.clock import describe_schedule_zone, format_iso_dual
+
+    print(f"  Next run: {format_iso_dual(result['next_run_at'])}")
+    # State the scheduling zone at creation time — this is the moment the user
+    # can still correct an hour they meant in local time.
+    print(color(f"  {describe_schedule_zone()}", Colors.DIM))
     _warn_if_gateway_not_running()
     return 0
 
@@ -469,7 +478,9 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
     job = result.get("job") or result.get("removed_job") or {}
     print(color(f"{success_verb} job: {job.get('name', job_id)} ({job_id})", Colors.GREEN))
     if action in {"resume", "run"} and result.get("job", {}).get("next_run_at"):
-        print(f"  Next run: {result['job']['next_run_at']}")
+        from cron.clock import format_iso_dual
+
+        print(f"  Next run: {format_iso_dual(result['job']['next_run_at'])}")
     if action == "run":
         job = result.get("job", {})
         if job.get("executed"):

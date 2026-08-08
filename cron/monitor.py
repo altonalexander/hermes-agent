@@ -195,7 +195,7 @@ def check_monitor(job: dict) -> MonitorOutcome:
 
 
 def _persist_monitor_state(job_id: str, new_hash: str, output: str) -> None:
-    from cron.jobs import _hermes_now, update_job
+    from cron.jobs import _scheduler_now, update_job
 
     _write_last_output(job_id, output)
     try:
@@ -204,7 +204,7 @@ def _persist_monitor_state(job_id: str, new_hash: str, output: str) -> None:
             {
                 "monitor_state": {
                     "last_output_hash": new_hash,
-                    "last_changed_at": _hermes_now().isoformat(),
+                    "last_changed_at": _scheduler_now().isoformat(),
                 }
             },
         )

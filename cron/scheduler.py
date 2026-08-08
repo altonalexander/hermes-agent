@@ -49,7 +49,7 @@ from hermes_cli.config import (
     load_config,
 )
 from hermes_cli.fallback_config import get_fallback_chain
-from hermes_time import now as _hermes_now
+from cron.clock import format_dual as _format_dual, now as _scheduler_now
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context,
@@ -292,6 +292,17 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
 from cron.executions import create_execution, finish_execution, mark_execution_running
+
+
+def _format_run_time(dt) -> str:
+    """Render a cron run time for a user-facing report.
+
+    Cron runs on UTC (see cron/clock.py), so an unlabelled wall clock here
+    reads as local time and misleads. format_dual states the UTC instant and
+    appends the user's local equivalent when it differs.
+    """
+    return _format_dual(dt, seconds=True)
+
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -3255,7 +3266,7 @@ def run_job(
             )
             ok, output = False, f"Script execution failed: {exc}"
 
-        now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+        now_iso = _format_run_time(_scheduler_now())
 
         if not ok:
             # Script crashed / timed out / exited non-zero.  Deliver the
@@ -3322,7 +3333,7 @@ def run_job(
     _monitor_context: Optional[str] = None
     if job_has_monitor(job):
         _mon = check_monitor(job)
-        _mon_now = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+        _mon_now = _format_run_time(_scheduler_now())
         if not _mon.ok:
             # Source failure is an ERROR, never a change: alert the user so
             # a broken monitor can't silently stop watching. Stored hash is
@@ -3459,7 +3470,7 @@ def run_job(
             silent_doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
-                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"**Run Time:** {_format_run_time(_scheduler_now())}\n\n"
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
             return True, silent_doc, SILENT_MARKER, None
@@ -3480,7 +3491,7 @@ def run_job(
         blocked_doc = (
             f"# Cron Job: {job_name}\n\n"
             f"**Job ID:** {job_id}\n"
-            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Run Time:** {_format_run_time(_scheduler_now())}\n"
             f"**Status:** BLOCKED\n\n"
             "The assembled prompt (user prompt + loaded skill content) tripped "
             "the cron injection scanner and the agent was NOT run.\n\n"
@@ -3494,7 +3505,7 @@ def run_job(
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    _cron_session_id = f"cron_{job_id}_{_scheduler_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -3872,7 +3883,7 @@ def run_job(
             blocked_doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
-                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"**Run Time:** {_format_run_time(_scheduler_now())}\n"
                 f"**Status:** BLOCKED (configuration)\n\n"
                 "Pre-dispatch validation found a configuration problem and "
                 "the agent was NOT run (no tokens spent).\n\n"
@@ -4326,7 +4337,7 @@ def run_job(
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
-**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Run Time:** {_format_run_time(_scheduler_now())}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 
 ## Prompt
@@ -4383,7 +4394,7 @@ def run_job(
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
-**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Run Time:** {_format_run_time(_scheduler_now())}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 
 ## Prompt
@@ -4459,7 +4470,7 @@ def run_job(
             # except-fallback below guarantees a non-blank title (#50535).
             try:
                 _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
-                _cron_title = f"{_title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
+                _cron_title = f"{_title_base} · {_scheduler_now().strftime('%b %d %H:%M')}"
                 if not _set_cron_session_title(
                     _session_db, _final_cron_session_id, _cron_title
                 ):
@@ -4910,7 +4921,7 @@ def tick(
             # sweeps on idle ticks so orphaned stdio children from crashed
             # jobs are reaped even when nothing is due.
             if verbose:
-                logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
+                logger.info("%s - No jobs due", _scheduler_now().strftime('%H:%M:%S'))
             try:
                 from tools.mcp_tool import _kill_orphaned_mcp_children
                 _kill_orphaned_mcp_children()
@@ -4919,7 +4930,7 @@ def tick(
             return 0
 
         if verbose:
-            logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
+            logger.info("%s - %s job(s) due", _scheduler_now().strftime('%H:%M:%S'), len(due_jobs))
 
         # Advance next_run_at for all recurring jobs FIRST, under the file lock,
         # before any execution begins.  This preserves at-most-once semantics.

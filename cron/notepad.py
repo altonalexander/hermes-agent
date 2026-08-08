@@ -29,7 +29,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
-from hermes_time import now as _hermes_now
+from cron.clock import now as _scheduler_now
 
 NOTEPAD_FILE = get_hermes_home().resolve() / "cron" / "notepad.db"
 MAX_VALUE_BYTES = 16 * 1024
@@ -95,7 +95,7 @@ def set_note(job_id: str, key: str, value: str) -> Dict[str, Any]:
     """Upsert one key. Raises ValueError when a size cap would be exceeded."""
     job_id, key, value = str(job_id), str(key), str(value)
     _validate(job_id, key, value)
-    now = _hermes_now().isoformat()
+    now = _scheduler_now().isoformat()
     with _transaction() as conn:
         row = conn.execute(
             """SELECT COALESCE(SUM(LENGTH(CAST(key AS BLOB))

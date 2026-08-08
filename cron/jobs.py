@@ -38,7 +38,7 @@ from typing import Optional, Dict, List, Any, Set, Tuple, Union, Collection
 
 logger = logging.getLogger(__name__)
 
-from hermes_time import now as _hermes_now
+from cron.clock import SCHEDULER_TZ_NAME, now as _scheduler_now
 from utils import atomic_replace, atomic_write_text
 
 # ``croniter`` compiles ~15 ms of regexes at import and only matters for
@@ -612,13 +612,20 @@ def parse_duration(s: str) -> int:
 def parse_schedule(schedule: str) -> Dict[str, Any]:
     """
     Parse schedule string into structured format.
-    
+
+    Every returned schedule carries ``timezone``: the zone its times are
+    expressed in. It is always ``"UTC"`` — cron runs on machine time by design
+    (see cron/clock.py) — but storing it makes persisted jobs self-describing,
+    lets a future per-job-timezone feature spot legacy records, and gives the
+    display layer something to label with instead of guessing.
+
     Returns dict with:
         - kind: "once" | "interval" | "cron"
+        - timezone: IANA-ish zone name the times are in (always "UTC" today)
         - For "once": "run_at" (ISO timestamp)
         - For "interval": "minutes" (int)
         - For "cron": "expr" (cron expression)
-    
+
     Examples:
         "30m"              → once in 30 minutes
         "2h"               → once in 2 hours
@@ -627,6 +634,13 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
         "0 9 * * *"        → cron expression
         "2026-02-03T14:00" → once at timestamp
     """
+    parsed = _parse_schedule_fields(schedule)
+    parsed.setdefault("timezone", SCHEDULER_TZ_NAME)
+    return parsed
+
+
+def _parse_schedule_fields(schedule: str) -> Dict[str, Any]:
+    """Parse the schedule string. See ``parse_schedule`` for the contract."""
     schedule = schedule.strip()
     original = schedule
     schedule_lower = schedule.lower()
@@ -668,18 +682,17 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             # Make naive timestamps timezone-aware at parse time so the stored
             # value doesn't depend on the system timezone matching at check time.
             #
-            # Anchor to the CONFIGURED Hermes timezone, not the server's local
-            # timezone. The due-check (`get_due_jobs`) compares `next_run_at`
-            # against `hermes_time.now()`, which uses the configured zone. If a
-            # naive "20:07" were interpreted as server-local (e.g. UTC) while
-            # now() runs in Asia/Kolkata, the stored instant would land hours
-            # off from the user's wall-clock intent — far enough that one-shots
-            # never become due and recurring jobs fire at the wrong time. Using
-            # the configured zone makes "20:07" mean 20:07 on the same clock the
-            # scheduler checks against (#51021).
+            # Anchor to the SCHEDULER zone (UTC), which is the same clock the
+            # due-check compares against — see cron/clock.py. A naive "20:07"
+            # therefore means 20:07 UTC. This is unchanged from the pre-
+            # decoupling behaviour (the configured zone was empty and resolved
+            # to the UTC host), and it is now stable: it no longer moves when
+            # the user changes their display timezone (#51021).
+            #
+            # Callers that surface this to a user must render it through
+            # cron.clock.format_dual() so the UTC intent is stated explicitly.
             if dt.tzinfo is None:
-                hermes_tz = _hermes_now().tzinfo
-                dt = dt.replace(tzinfo=hermes_tz)
+                dt = dt.replace(tzinfo=_scheduler_now().tzinfo)
             return {
                 "kind": "once",
                 "run_at": dt.isoformat(),
@@ -691,7 +704,7 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
     # Duration like "30m", "2h", "1d" → one-shot from now
     try:
         minutes = parse_duration(schedule)
-        run_at = _hermes_now() + timedelta(minutes=minutes)
+        run_at = _scheduler_now() + timedelta(minutes=minutes)
         return {
             "kind": "once",
             "run_at": run_at.isoformat(),
@@ -710,18 +723,18 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
 
 
 def _ensure_aware(dt: datetime) -> datetime:
-    """Return a timezone-aware datetime in Hermes configured timezone.
+    """Return a timezone-aware datetime in the scheduler timezone (UTC).
 
     Backward compatibility:
     - Older stored timestamps may be naive.
     - Naive values are interpreted as *system-local wall time* (the timezone
       `datetime.now()` used when they were created), then converted to the
-      configured Hermes timezone.
+      scheduler timezone.
 
     This preserves relative ordering for legacy naive timestamps across
     timezone changes and avoids false not-due results.
     """
-    target_tz = _hermes_now().tzinfo
+    target_tz = _scheduler_now().tzinfo
     if dt.tzinfo is None:
         local_tz = datetime.now().astimezone().tzinfo
         return dt.replace(tzinfo=local_tz).astimezone(target_tz)
@@ -804,7 +817,7 @@ def _compute_grace_seconds(schedule: dict) -> int:
         expr = schedule.get("expr")
         if expr:
             try:
-                now = _hermes_now()
+                now = _scheduler_now()
                 cron = croniter(expr, now)
                 first = cron.get_next(datetime)
                 second = cron.get_next(datetime)
@@ -822,8 +835,34 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
     Compute the next run time for a schedule.
 
     Returns ISO timestamp string, or None if no more runs.
+
+    UTC-ONLY BY DESIGN — read before changing the base timezone
+    ----------------------------------------------------------
+    The croniter base below must stay in UTC (see cron/clock.py). croniter does
+    *absolute-instant* arithmetic: handed a tz-aware base in a DST-observing
+    zone it adds a fixed 24h rather than advancing the wall clock, so a daily
+    job drifts by an hour across every transition. Measured with croniter 6.0.0
+    for ``0 7 * * *`` in America/Denver:
+
+        fall-back  2026-11-01 -> 08:00 local (one hour late)
+        spring-fwd 2026-03-08 -> 06:00 local (one hour early)
+
+    UTC has no transitions, so pinning the base here keeps that dormant.
+
+    If cron ever moves to a DST-observing zone, this must be fixed FIRST.
+    The fix is to give croniter a *naive local* base and re-attach the zone to
+    its output — note that re-localizing croniter's already-aware output does
+    not work, it still yields the drifted wall clock::
+
+        naive = base_time.replace(tzinfo=None)
+        nxt = croniter(expr, naive).get_next(datetime)
+        return nxt.replace(tzinfo=tz)
+
+    That change also needs a policy for the spring-forward gap and the
+    fall-back repeated hour, plus a migration for stored ``next_run_at``
+    values, which is why it is deliberately not done here.
     """
-    now = _hermes_now()
+    now = _scheduler_now()
 
     if not isinstance(schedule, dict):
         return None
@@ -1291,7 +1330,7 @@ def _save_jobs_unlocked(
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     json.dump(
-                        {"jobs": jobs, "updated_at": _hermes_now().isoformat()},
+                        {"jobs": jobs, "updated_at": _scheduler_now().isoformat()},
                         f,
                         indent=2,
                         ensure_ascii=False,
@@ -1360,7 +1399,7 @@ def _save_jobs_unlocked(
         )
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(
-                {"jobs": jobs, "updated_at": _hermes_now().isoformat()},
+                {"jobs": jobs, "updated_at": _scheduler_now().isoformat()},
                 f,
                 indent=2,
                 ensure_ascii=False,
@@ -1662,7 +1701,7 @@ def create_job(
         deliver = "origin" if origin else "local"
 
     job_id = uuid.uuid4().hex[:12]
-    now = _hermes_now().isoformat()
+    now = _scheduler_now().isoformat()
 
     normalized_skills = _normalize_skill_list(skill, skills)
     normalized_model = _normalize_job_optional_text(model)
@@ -1991,7 +2030,7 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
         {
             "enabled": False,
             "state": "paused",
-            "paused_at": _hermes_now().isoformat(),
+            "paused_at": _scheduler_now().isoformat(),
             "paused_reason": reason,
         },
     )
@@ -2034,7 +2073,7 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "state": "scheduled",
             "paused_at": None,
             "paused_reason": None,
-            "next_run_at": _hermes_now().isoformat(),
+            "next_run_at": _scheduler_now().isoformat(),
         },
     )
 
@@ -2130,7 +2169,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
-                now = _hermes_now().isoformat()
+                now = _scheduler_now().isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = status or ("ok" if success else "error")
                 job["last_error"] = error if not success else None
@@ -2250,7 +2289,7 @@ def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
             f"- name: {job.get('name')}\n"
             f"- dispatch claimed: {repeat.get('completed', '?')}/{repeat.get('times', '?')}\n"
             f"- run claimed at: {claim.get('at', 'unknown')} by {claim.get('by', 'unknown')}\n"
-            f"- removed at: {_hermes_now().isoformat()}\n\n"
+            f"- removed at: {_scheduler_now().isoformat()}\n\n"
             "This one-shot job's dispatch was claimed, but the run never "
             "completed (`last_run_at` was never written) — the scheduler "
             "process was most likely killed or restarted mid-execution. The "
@@ -2378,7 +2417,7 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
             claim = job.get("run_claim")
             if not isinstance(claim, dict) or claim.get("by") != expected_owner:
                 return False
-            claim["at"] = _hermes_now().isoformat()
+            claim["at"] = _scheduler_now().isoformat()
             save_jobs(jobs)
             return True
     return False
@@ -2404,7 +2443,7 @@ def advance_next_runs(job_ids) -> int:
         return 0
     with _jobs_lock():
         jobs = load_jobs()
-        now = _hermes_now().isoformat()
+        now = _scheduler_now().isoformat()
         advanced = 0
         for job in jobs:
             if job["id"] not in ids:
@@ -2485,7 +2524,7 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
             # (enabled=true, state=paused/paused_at set) must not claim.
             if not is_job_runnable(job):
                 return False
-            now = _hermes_now()
+            now = _scheduler_now()
             existing = job.get("fire_claim")
             if existing:
                 try:
@@ -2618,7 +2657,7 @@ def get_due_jobs() -> List[Dict[str, Any]]:
 
 def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     """Inner implementation of get_due_jobs(); must be called with _jobs_lock held."""
-    now = _hermes_now()
+    now = _scheduler_now()
     raw_jobs = load_jobs()
     needs_save = False
     intentionally_removed: Set[str] = set()
@@ -3052,7 +3091,7 @@ def save_job_output(job_id: str, output: str):
     job_output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(job_output_dir)
 
-    timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
+    timestamp = _scheduler_now().strftime("%Y-%m-%d_%H-%M-%S")
     output_file = job_output_dir / f"{timestamp}.md"
 
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
