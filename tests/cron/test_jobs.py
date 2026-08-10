@@ -24,7 +24,7 @@ from cron.jobs import (
     heartbeat_run_claim,
     get_due_jobs,
     save_job_output,
-    _hermes_now,
+    _scheduler_now,
 )
 
 
@@ -296,7 +296,7 @@ class TestPauseResumeJob:
         where state=paused coexisted with enabled=true and jobs kept firing.
         """
         job = create_job(prompt="Must not fire while paused", schedule="every 1h")
-        past = (_hermes_now() - timedelta(hours=2)).isoformat()
+        past = (_scheduler_now() - timedelta(hours=2)).isoformat()
         # Force the job overdue, then pause.
         updated = update_job(job["id"], {"next_run_at": past})
         assert updated["enabled"] is True
@@ -322,7 +322,7 @@ class TestPauseResumeJob:
 
     def test_contradictory_half_pause_self_disables_and_does_not_fire(self, tmp_cron_dir):
         """enabled=true + paused_at must not fire; scan heals enabled=false."""
-        now = _hermes_now()
+        now = _scheduler_now()
         job = {
             "id": "half-paused-1",
             "name": "half-paused",
