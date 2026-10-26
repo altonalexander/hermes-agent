@@ -12,7 +12,10 @@ import pytest
 
 pytest.importorskip("aiohttp")
 
-from gateway.platforms.api_server import _resolve_media_to_data_urls  # noqa: E402
+from gateway.platforms.api_server import (  # noqa: E402
+    _StreamingMediaResolver,
+    _resolve_media_to_data_urls,
+)
 
 # 1x1 transparent PNG
 _PNG_BYTES = base64.b64decode(
@@ -49,6 +52,43 @@ class TestResolveMediaToDataUrls(unittest.TestCase):
     def test_non_image_left_untouched(self):
         text = "MEDIA:/tmp/archive.zip"
         self.assertEqual(_resolve_media_to_data_urls(text), text)
+
+
+class TestStreamingMediaResolver(unittest.TestCase):
+    """Streamed replies never reach ``final_response`` resolution, so the
+    resolver has to inline tags as the deltas go out."""
+
+    def _stream(self, deltas):
+        r = _StreamingMediaResolver()
+        return [r.feed(d) for d in deltas] + [r.flush()]
+
+    def test_tag_split_across_deltas_is_inlined(self):
+        p = TestResolveMediaToDataUrls()._write_png()
+        text = f"Here it is:\n\nMEDIA:{p}"
+        cut = text.index("MEDIA:") + 3
+        out = self._stream([text[:cut - 5], text[cut - 5:cut], text[cut:cut + 4], text[cut + 4:]])
+        joined = "".join(out)
+        self.assertIn("data:image/png;base64,", joined)
+        self.assertNotIn("MEDIA:", joined)
+        self.assertTrue(joined.startswith("Here it is:"))
+
+    def test_plain_text_passes_through_immediately(self):
+        r = _StreamingMediaResolver()
+        self.assertEqual(r.feed("hello "), "hello ")
+        self.assertEqual(r.feed("world"), "world")
+        self.assertEqual(r.flush(), "")
+
+    def test_text_after_tag_line_is_released(self):
+        p = TestResolveMediaToDataUrls()._write_png()
+        r = _StreamingMediaResolver()
+        self.assertEqual(r.feed(f"MEDIA:{p}"), "")
+        out = r.feed("\nDone.")
+        self.assertIn("data:image/png;base64,", out)
+        self.assertTrue(out.endswith("Done."))
+
+    def test_unresolvable_tag_is_left_as_text(self):
+        out = "".join(self._stream(["MEDIA:/nonexistent/", "shot.png"]))
+        self.assertEqual(out, "MEDIA:/nonexistent/shot.png")
 
 
 if __name__ == "__main__":
