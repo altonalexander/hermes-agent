@@ -1158,6 +1158,46 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return text
 
 
+class _StreamingMediaResolver:
+    """Inline ``MEDIA:<path>`` image tags in a streamed reply.
+
+    ``_resolve_media_to_data_urls`` runs on ``final_response``, which only the
+    non-streaming paths send. A streaming client (Open WebUI) was handed the
+    raw tag as a server-local path it can never open. Text from the start of a
+    tag is held back until its line ends (or the stream does), then inlined
+    through the same resolver; everything else passes through unchanged.
+    """
+
+    _TAG = "MEDIA:"
+    # Never stall a stream on a tag that never ends its line.
+    _MAX_HELD = 4096
+
+    def __init__(self) -> None:
+        self._buf = ""
+
+    def feed(self, text: str) -> str:
+        self._buf += text
+        hold = self._hold_from()
+        if len(self._buf) - hold > self._MAX_HELD:
+            hold = len(self._buf)
+        out, self._buf = self._buf[:hold], self._buf[hold:]
+        return _resolve_media_to_data_urls(out) if out else ""
+
+    def flush(self) -> str:
+        out, self._buf = self._buf, ""
+        return _resolve_media_to_data_urls(out) if out else ""
+
+    def _hold_from(self) -> int:
+        idx = self._buf.rfind(self._TAG)
+        if idx != -1 and "\n" not in self._buf[idx:]:
+            return idx
+        # A tag split across deltas: hold a tail that could begin one.
+        for n in range(min(len(self._TAG) - 1, len(self._buf)), 0, -1):
+            if self._TAG.startswith(self._buf[-n:]):
+                return len(self._buf) - n
+        return len(self._buf)
+
+
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     """Redact API-bound error text before it crosses the HTTP boundary."""
     redacted = redact_sensitive_text(str(value), force=True)
@@ -4628,17 +4668,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 about ``delta.content`` ignores them, exactly as before.
                 """
                 if isinstance(item, tuple) and len(item) == 2 and item[0] in _CUSTOM_SSE_EVENTS:
+                    await _write_content(media.flush())
                     await response.write(
                         _sse_frame(item[1], event=_CUSTOM_SSE_EVENTS[item[0]])
                     )
                 else:
-                    content_chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
-                    }
-                    await response.write(_sse_frame(content_chunk))
+                    await _write_content(media.feed(item))
                 return time.monotonic()
+
+            async def _write_content(text):
+                if not text:
+                    return
+                content_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                }
+                await response.write(_sse_frame(content_chunk))
+
+            media = _StreamingMediaResolver()
 
             # Stream content chunks as they arrive from the agent. Woken
             # directly by put_threadsafe's call_soon_threadsafe — no
@@ -4668,6 +4716,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
 
                 last_activity = await _emit(delta)
+
+            await _write_content(media.flush())
 
             # Get usage from completed agent. The agent can fail two ways
             # after the content queue terminates cleanly: (1) ``agent_task``
